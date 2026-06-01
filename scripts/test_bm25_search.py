@@ -35,7 +35,7 @@ client = OpenSearch(
 )
 
 
-def search_bm25(question, permission_level):
+def search_bm25(question, permission_level, employee_id=None):
     indices = ACCESSIBLE_INDICES.get(permission_level, [])
 
     if not indices:
@@ -44,12 +44,28 @@ def search_bm25(question, permission_level):
 
     query = {
         "query": {
-            "match": {
-                "embedding_text": question
+            "bool": {
+                "must": [
+                    {
+                        "match": {
+                            "embedding_text": question
+                        }
+                    }
+                ],
+                "filter": []
             }
         },
         "size": 5
     }
+
+    if employee_id:
+        query["query"]["bool"]["filter"].append(
+            {
+                "term": {
+                    "employee_id": employee_id
+                }
+            }
+        )
 
     response = client.search(
         index=indices,
@@ -65,12 +81,14 @@ def search_bm25(question, permission_level):
         print("인덱스:", hit["_index"])
         print("점수:", hit["_score"])
         print("문서ID:", hit["_id"])
+        print("사번:", hit["_source"].get("employee_id"))
         print("내용:", hit["_source"].get("embedding_text"))
         print("-" * 50)
 
 
 if __name__ == "__main__":
     search_bm25(
-        question="인사팀 직원 정보 알려줘",
+        question="인사관리 정보 알려줘",
         permission_level=2,
+        employee_id="EMP1086",
     )
