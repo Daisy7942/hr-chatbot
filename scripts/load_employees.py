@@ -1,5 +1,7 @@
 import json
 from pathlib import Path
+import os
+from dotenv import load_dotenv
 
 from opensearchpy import OpenSearch
 from sentence_transformers import SentenceTransformer
@@ -9,15 +11,15 @@ from sentence_transformers import SentenceTransformer
 # 기본 설정
 # =========================
 
-INDEX_NAME = "employees"
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_PATH = BASE_DIR / "data" / "employees_sample.jsonl"
 
-OPENSEARCH_HOST = "localhost"
-OPENSEARCH_PORT = 9200
-OPENSEARCH_USER = "durian"
-OPENSEARCH_PASSWORD = "admin123!"
+load_dotenv()
+OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "localhost")
+OPENSEARCH_PORT = int(os.getenv("OPENSEARCH_PORT", 9200))
+OPENSEARCH_USER = os.getenv("OPENSEARCH_USER")
+OPENSEARCH_PASSWORD = os.getenv("OPENSEARCH_PASSWORD")
 
 EMBEDDING_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
@@ -60,6 +62,25 @@ def load_jsonl(file_path: Path):
 
             yield json.loads(line)
 
+def get_index_name(doc):
+    """
+    문서의 doc_type과 security_level을 기준으로 저장할 OpenSearch 인덱스 이름 결정
+    """
+    doc_type = doc.get("doc_type")
+    security_level = doc.get("security_level")
+
+    if doc_type == "basic":
+        return f"hr_basic_{security_level}"
+
+    if doc_type == "performance":
+        return f"hr_performance_{security_level}"
+
+    if doc_type == "salary":
+        return f"hr_salary_{security_level}"
+
+    raise ValueError(f"알 수 없는 doc_type입니다: {doc_type}")
+
+
 
 def main():
     if not DATA_PATH.exists():
@@ -88,15 +109,16 @@ def main():
         # OpenSearch에 저장할 문서에 벡터 추가
         doc["embedding_vector"] = embedding_vector
 
-        # OpenSearch employees 인덱스에 저장
+        target_index = get_index_name(doc)
+
         client.index(
-            index=INDEX_NAME,
+            index=target_index,
             id=doc_id,
             body=doc,
         )
 
         success_count += 1
-        print(f"저장 완료: {doc_id}")
+        print(f"저장 완료: {target_index} / {doc_id}")
 
     print(f"\n총 {success_count}개 문서 적재 완료")
 
