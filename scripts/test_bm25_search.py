@@ -35,6 +35,21 @@ client = OpenSearch(
 )
 
 
+def build_context(search_hits):
+    context_list = []
+
+    for hit in search_hits:
+        index_name = hit["_index"]
+        doc_id = hit["_id"]
+        source = hit["_source"]
+        embedding_text = source.get("embedding_text", "")
+
+        context = f"[출처: {index_name} / {doc_id}]\n{embedding_text}"
+        context_list.append(context)
+
+    return "\n\n".join(context_list)
+
+
 def search_bm25(question, permission_level, employee_id=None):
     indices = ACCESSIBLE_INDICES.get(permission_level, [])
 
@@ -55,7 +70,7 @@ def search_bm25(question, permission_level, employee_id=None):
                 "filter": []
             }
         },
-        "size": 5
+        "size": 5,
     }
 
     if employee_id:
@@ -76,6 +91,12 @@ def search_bm25(question, permission_level, employee_id=None):
     print(f"검색 대상 인덱스: {indices}")
     print(f"검색 결과 수: {total}")
     print("-" * 50)
+
+    context = build_context(response["hits"]["hits"])
+
+    print("LLM에 전달할 Context:")
+    print(context)
+    print("=" * 50)
 
     for hit in response["hits"]["hits"]:
         print("인덱스:", hit["_index"])
