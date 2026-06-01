@@ -1,0 +1,76 @@
+import os
+from dotenv import load_dotenv
+from opensearchpy import OpenSearch
+
+
+ACCESSIBLE_INDICES = {
+    1: ["hr_basic_1"],
+    2: ["hr_basic_1", "hr_basic_2", "hr_performance_2", "hr_salary_2"],
+    3: [
+        "hr_basic_1",
+        "hr_basic_2",
+        "hr_basic_3",
+        "hr_performance_2",
+        "hr_performance_3",
+        "hr_salary_2",
+        "hr_salary_3",
+    ],
+}
+
+
+load_dotenv()
+
+OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "localhost")
+OPENSEARCH_PORT = int(os.getenv("OPENSEARCH_PORT", 9200))
+OPENSEARCH_USER = os.getenv("OPENSEARCH_USER")
+OPENSEARCH_PASSWORD = os.getenv("OPENSEARCH_PASSWORD")
+
+
+client = OpenSearch(
+    hosts=[{"host": OPENSEARCH_HOST, "port": OPENSEARCH_PORT}],
+    http_auth=(OPENSEARCH_USER, OPENSEARCH_PASSWORD),
+    use_ssl=True,
+    verify_certs=False,
+    ssl_show_warn=False,
+)
+
+
+def search_bm25(question, permission_level):
+    indices = ACCESSIBLE_INDICES.get(permission_level, [])
+
+    if not indices:
+        print("접근 가능한 인덱스가 없습니다.")
+        return
+
+    query = {
+        "query": {
+            "match": {
+                "embedding_text": question
+            }
+        },
+        "size": 5
+    }
+
+    response = client.search(
+        index=indices,
+        body=query,
+    )
+
+    total = response["hits"]["total"]["value"]
+    print(f"검색 대상 인덱스: {indices}")
+    print(f"검색 결과 수: {total}")
+    print("-" * 50)
+
+    for hit in response["hits"]["hits"]:
+        print("인덱스:", hit["_index"])
+        print("점수:", hit["_score"])
+        print("문서ID:", hit["_id"])
+        print("내용:", hit["_source"].get("embedding_text"))
+        print("-" * 50)
+
+
+if __name__ == "__main__":
+    search_bm25(
+        question="인사팀 직원 정보 알려줘",
+        permission_level=2,
+    )
