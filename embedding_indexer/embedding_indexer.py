@@ -1,7 +1,10 @@
 import os
 import re
 import json
+import zipfile
+import urllib.request
 from pathlib import Path
+from datetime import datetime
 from dotenv import load_dotenv
 from opensearchpy import OpenSearch, helpers
 from sentence_transformers import SentenceTransformer
@@ -9,8 +12,10 @@ from sentence_transformers import SentenceTransformer
 load_dotenv()
 
 # ── 경로 설정 ──────────────────────────────────────────────────────────────────
-BASE_DIR  = Path(__file__).resolve().parent.parent
-INPUT_DIR = Path(os.getenv('INPUT_DIR', str(BASE_DIR / 'Chunking' / 'output')))
+BASE_DIR            = Path(__file__).resolve().parent.parent
+INPUT_DIR           = Path(os.getenv('INPUT_DIR', str(BASE_DIR / 'Chunking' / 'output')))
+OPENSEARCH_HOME     = Path(os.getenv('OPENSEARCH_HOME', str(BASE_DIR / 'opensearch-3.3.2'))).resolve()
+LAST_INDEXED_FILE   = Path(__file__).resolve().parent / 'last_indexed.txt'
 
 # ── OpenSearch 연결 설정 ────────────────────────────────────────────────────────
 OPENSEARCH_HOST         = os.getenv('OPENSEARCH_HOST', 'localhost')
@@ -21,11 +26,16 @@ OPENSEARCH_USE_SSL      = os.getenv('OPENSEARCH_USE_SSL', 'true').lower() == 'tr
 OPENSEARCH_VERIFY_CERTS = os.getenv('OPENSEARCH_VERIFY_CERTS', 'false').lower() == 'true'
 
 # ── 임베딩 모델 ────────────────────────────────────────────────────────────────
-EMBEDDING_MODEL = os.getenv('EMBED_MODEL_NAME', 'paraphrase-multilingual-MiniLM-L12-v2')
+EMBEDDING_MODEL      = os.getenv('EMBED_MODEL_NAME', 'paraphrase-multilingual-MiniLM-L12-v2')
+EMBEDDING_DIM        = int(os.getenv('EMBED_DIMENSION', '384'))
+EMBEDDING_BATCH_SIZE = int(os.getenv('EMBED_BATCH_SIZE', '64'))
+
+# ── KNN 설정 ───────────────────────────────────────────────────────────────────
+KNN_ENGINE     = os.getenv('KNN_ENGINE',     'lucene')
+KNN_METHOD     = os.getenv('KNN_METHOD',     'hnsw')
+KNN_SPACE_TYPE = os.getenv('KNN_SPACE_TYPE', 'cosinesimil')
 
 # ── 인덱스별 설정 ───────────────────────────────────────────────────────────────
-# source  : JSONL의 source 값과 매칭
-# fields  : 이 인덱스에 포함할 embedding_text 필드 목록
 INDEX_CONFIG = {
     'hr_basic_1': {
         'security_level': 1,
@@ -101,43 +111,83 @@ ALL_FIELDS = sorted(
     key=len, reverse=True
 )
 
-# ── 인덱스 매핑 (공통 구조) ────────────────────────────────────────────────────
-INDEX_BODY = {
-    'settings': {
-        'index': {'knn': True},
-        'analysis': {
-            'analyzer': {
-                'korean_analyzer': {
-                    'type': 'custom',
-                    'tokenizer': 'nori_tokenizer',
+
+# ── 마지막 인덱싱 시간 관리 ────────────────────────────────────────────────────
+def read_last_indexed():
+    if not LAST_INDEXED_FILE.exists():
+        return None
+    return LAST_INDEXED_FILE.read_text(encoding='utf-8').strip()
+
+
+def write_last_indexed(timestamp: str):
+    LAST_INDEXED_FILE.write_text(timestamp, encoding='utf-8')
+
+
+# ── 인덱스 매핑 ────────────────────────────────────────────────────────────────
+def build_index_body(security_level: int) -> dict:
+    return {
+        'settings': {
+            'index': {'knn': True},
+            'analysis': {
+                'analyzer': {
+                    'korean_analyzer': {
+                        'type': 'custom',
+                        'tokenizer': 'nori_tokenizer',
+                    }
                 }
+            },
+        },
+        'mappings': {
+            '_meta': {'security_level': security_level},
+            'properties': {
+                'employee_id':      {'type': 'keyword'},
+                'employee_name':    {'type': 'keyword'},
+                'department':       {'type': 'keyword'},
+                'department_level': {'type': 'integer'},
+                'job_grade':        {'type': 'keyword'},
+                'job_grade_level':  {'type': 'integer'},
+                'source':           {'type': 'keyword'},
+                'timestamp':        {'type': 'keyword'},
+                'changed':          {'type': 'object', 'enabled': False},
+                'embedding_text':   {'type': 'text', 'analyzer': 'korean_analyzer'},
+                'embedding_vector': {
+                    'type': 'knn_vector',
+                    'dimension': EMBEDDING_DIM,
+                    'method': {
+                        'engine': KNN_ENGINE,
+                        'name': KNN_METHOD,
+                        'space_type': KNN_SPACE_TYPE,
+                    },
+                },
             }
         },
-    },
-    'mappings': {
-        'properties': {
-            'employee_id':      {'type': 'keyword'},
-            'employee_name':    {'type': 'keyword'},
-            'department':       {'type': 'keyword'},
-            'department_level': {'type': 'integer'},
-            'job_grade':        {'type': 'keyword'},
-            'job_grade_level':  {'type': 'integer'},
-            'source':           {'type': 'keyword'},
-            'timestamp':        {'type': 'keyword'},
-            'changed':          {'type': 'object', 'enabled': False},
-            'embedding_text':   {'type': 'text', 'analyzer': 'korean_analyzer'},
-            'embedding_vector': {
-                'type': 'knn_vector',
-                'dimension': 384,
-                'method': {
-                    'engine': 'lucene',
-                    'name': 'hnsw',
-                    'space_type': 'cosinesimil',
-                },
-            },
-        }
-    },
-}
+    }
+
+
+def ensure_nori_plugin(client):
+    nori_dir = OPENSEARCH_HOME / 'plugins' / 'analysis-nori'
+    if nori_dir.exists():
+        return
+
+    info = client.info()
+    version = info['version']['number']
+    url = (
+        f'https://artifacts.opensearch.org/releases/plugins/'
+        f'analysis-nori/{version}/analysis-nori-{version}.zip'
+    )
+    zip_path = Path(os.getenv('TEMP', '/tmp')) / f'analysis-nori-{version}.zip'
+
+    print(f'nori 플러그인 다운로드 중... ({url})')
+    urllib.request.urlretrieve(url, zip_path)
+
+    nori_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        z.extractall(nori_dir)
+    zip_path.unlink()
+
+    print('nori 플러그인 설치 완료!')
+    print('OpenSearch를 재시작한 후 다시 실행해 주세요.')
+    raise SystemExit(0)
 
 
 def parse_embedding_text(text):
@@ -162,14 +212,36 @@ def create_indices(client):
     print('=== 인덱스 생성 ===')
     for name, config in INDEX_CONFIG.items():
         if client.indices.exists(index=name):
-            client.indices.delete(index=name)
-            print(f'  기존 삭제: {name}')
-        client.indices.create(index=name, body=INDEX_BODY)
+            print(f'  이미 존재: {name}  (건너뜀)')
+            continue
+        client.indices.create(index=name, body=build_index_body(config['security_level']))
         print(f'  생성 완료: {name}  (security_level={config["security_level"]})')
 
 
-def load_data(client, model):
+def get_existing_employee_ids(client, index_name):
+    resp = client.search(
+        index=index_name,
+        body={
+            'size': 0,
+            'aggs': {'employees': {'terms': {'field': 'employee_id', 'size': 100000}}},
+        },
+    )
+    return {b['key'] for b in resp['aggregations']['employees']['buckets']}
+
+
+def needs_update(rec, last_indexed):
+    if last_indexed is None:
+        return True
+    changed = rec.get('changed', [])
+    if not changed:
+        return False
+    latest = max(entry['timestamp'] for entry in changed)
+    return latest > last_indexed
+
+
+def load_data(client, model, last_indexed):
     print('\n=== 데이터 적재 ===')
+    print(f'  기준 시간: {last_indexed or "첫 실행 (전체 적재)"}')
 
     for jsonl_file in sorted(INPUT_DIR.glob('*.jsonl')):
         records = []
@@ -189,15 +261,42 @@ def load_data(client, model):
             print(f'  건너뜀: {jsonl_file.name}  (source={source_name})')
             continue
 
-        print(f'\n  {jsonl_file.name}  ({source_name})  총 {len(records):,}청크 → {len(index_names)}개 인덱스')
+        print(f'\n  {jsonl_file.name}  ({source_name})  총 {len(records):,}건')
 
         for index_name in index_names:
             fields = INDEX_CONFIG[index_name]['fields']
 
+            existing_ids = get_existing_employee_ids(client, index_name)
+
+            new_ids     = set()
+            update_ids  = set()
+            for rec in records:
+                emp_id = rec.get('employee_id', '')
+                if emp_id not in existing_ids:
+                    new_ids.add(emp_id)
+                elif needs_update(rec, last_indexed):
+                    update_ids.add(emp_id)
+
+            process_ids = new_ids | update_ids
+
+            if not process_ids:
+                print(f'    [{index_name}]  변경 없음 (건너뜀)')
+                continue
+
+            # 변경된 직원의 기존 청크 삭제 (청크 수 변동 대비)
+            if update_ids:
+                client.delete_by_query(
+                    index=index_name,
+                    body={'query': {'terms': {'employee_id': list(update_ids)}}},
+                    params={'refresh': 'true'},
+                )
+
+            target_records = [r for r in records if r.get('employee_id') in process_ids]
+
             texts = []
             valid_records = []
-            for rec in records:
-                parsed  = parse_embedding_text(rec.get('embedding_text', ''))
+            for rec in target_records:
+                parsed   = parse_embedding_text(rec.get('embedding_text', ''))
                 filtered = build_filtered_text(parsed, fields)
                 if not filtered:
                     continue
@@ -207,12 +306,20 @@ def load_data(client, model):
             if not texts:
                 continue
 
-            vectors = model.encode(texts, batch_size=64, show_progress_bar=False, convert_to_numpy=True)
+            vectors = model.encode(
+                texts, batch_size=EMBEDDING_BATCH_SIZE,
+                show_progress_bar=False, convert_to_numpy=True,
+            )
 
+            chunk_counters = {}
             actions = []
             for i, rec in enumerate(valid_records):
+                emp_id = rec.get('employee_id', str(i))
+                chunk_counters[emp_id] = chunk_counters.get(emp_id, 0) + 1
+                doc_id = f"{emp_id}_{chunk_counters[emp_id]:04d}"
                 actions.append({
                     '_index':  index_name,
+                    '_id':     doc_id,
                     '_source': {
                         'employee_id':      rec.get('employee_id', ''),
                         'employee_name':    rec.get('employee_name', ''),
@@ -229,7 +336,11 @@ def load_data(client, model):
                 })
 
             success, failed = helpers.bulk(client, actions, raise_on_error=False)
-            print(f'    [{index_name}]  {success:,}건 성공 / 실패 {len(failed)}건')
+            print(
+                f'    [{index_name}]  '
+                f'신규 {len(new_ids)}명 / 변경 {len(update_ids)}명  →  '
+                f'{success:,}건 성공 / 실패 {len(failed)}건'
+            )
 
 
 def main():
@@ -241,13 +352,20 @@ def main():
         ssl_show_warn=False,
     )
 
+    ensure_nori_plugin(client)
+
+    last_indexed = read_last_indexed()
+
     print(f'임베딩 모델 로딩: {EMBEDDING_MODEL}')
     model = SentenceTransformer(EMBEDDING_MODEL)
 
     create_indices(client)
-    load_data(client, model)
+    load_data(client, model, last_indexed)
 
-    print('\n=== 전체 완료 ===')
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    write_last_indexed(now)
+
+    print(f'\n=== 전체 완료 ({now}) ===')
 
 
 if __name__ == '__main__':

@@ -42,3 +42,7 @@ Thumbs.db
 
 # 가상환경
 venv/
+
+# OpenSearch
+opensearch-3.3.2/
+opensearch-dashboards-3.3.0/

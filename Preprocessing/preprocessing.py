@@ -7,10 +7,11 @@ from dotenv import load_dotenv
 print(f'pandas 버전: {pd.__version__}')
 print('라이브러리 로딩 완료!')
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / '.env')
 
-INPUT_DIR  = Path(os.getenv('INPUT_DIR',  'dataset'))
-OUTPUT_DIR = Path(os.getenv('OUTPUT_DIR', 'output'))
+INPUT_DIR  = BASE_DIR / Path(os.getenv('INPUT_DIR',  'dataset'))
+OUTPUT_DIR = BASE_DIR / Path(os.getenv('OUTPUT_DIR', 'output'))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
