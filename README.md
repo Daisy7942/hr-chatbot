@@ -24,15 +24,17 @@ OpenSearch가 실행 중이어야 합니다.
 
 ### 1단계 — 전처리 (`Preprocessing/`)
 
-원본 CSV를 정제하여 `Preprocessing/output/`에 저장합니다.
+원본 CSV를 정제하여 `Preprocessing/output/`에 저장합니다.  
+에러 내역은 `Preprocessing/output/error.log`에 기록됩니다.
 
 ```
 Preprocessing/dataset/*.csv  →  Preprocessing/output/*_정제.csv
 ```
 
 **실행**
-```
-Preprocessing/preprocessing.ipynb
+```bash
+cd Preprocessing
+python preprocessing.py
 ```
 
 **환경 설정** (`Preprocessing/.env`)
@@ -45,15 +47,17 @@ OUTPUT_DIR=output
 
 ### 2단계 — JSONL 변환 (`JSONL/`)
 
-정제된 CSV를 JSONL 형식으로 변환합니다.
+정제된 CSV를 JSONL 형식으로 변환합니다.  
+재실행 시 변경된 필드를 `changed` 배열에 기록합니다.
 
 ```
 Preprocessing/output/*_정제.csv  →  JSONL/output/*_정제.jsonl
 ```
 
 **실행**
-```
-JSONL/jsonl_conversion.ipynb
+```bash
+cd JSONL
+python jsonl_conversion.py
 ```
 
 **환경 설정** (`JSONL/.env`)
@@ -73,8 +77,9 @@ JSONL/output/*_정제.jsonl  →  Chunking/output/*_정제.jsonl
 ```
 
 **실행**
-```
-Chunking/splitting_chunking.ipynb
+```bash
+cd Chunking
+python splitting_chunking.py
 ```
 
 **환경 설정** (`Chunking/.env`)
@@ -92,32 +97,44 @@ CHUNK_OVERLAP=50
 청킹된 JSONL을 읽어 인덱스별로 `embedding_text`를 재구성하고  
 임베딩 벡터를 생성하여 OpenSearch 7개 인덱스에 적재합니다.
 
+- nori 플러그인이 없으면 자동으로 다운로드 후 설치 안내를 출력합니다.
+- 이전 실행 시각(`last_indexed.txt`)을 기준으로 변경된 직원만 증분 적재합니다.
+
 ```
 Chunking/output/*_정제.jsonl  →  OpenSearch (hr_basic_1~3, hr_performance_2~3, hr_salary_2~3)
 ```
 
-**실행 (노트북)**
-```
-embedding_indexer/embedding_indexer.ipynb
-```
-
-**실행 (스크립트)**
+**실행**
 ```bash
-python embedding_indexer/embedding_indexer.py
+cd embedding_indexer
+python embedding_indexer.py
 ```
 
 **환경 설정** (`embedding_indexer/.env`)
 ```
+# 입출력 경로
 INPUT_DIR=../Chunking/output
 
+# OpenSearch 연결 설정
 OPENSEARCH_HOST=localhost
 OPENSEARCH_PORT=9200
-OPENSEARCH_USER=admin
+OPENSEARCH_USER=durian
 OPENSEARCH_PASSWORD=Admin1234!
 OPENSEARCH_USE_SSL=true
 OPENSEARCH_VERIFY_CERTS=false
 
+# OpenSearch 홈 경로 (nori 플러그인 자동 설치에 사용)
+OPENSEARCH_HOME=../opensearch-3.3.2
+
+# 임베딩 모델
 EMBED_MODEL_NAME=paraphrase-multilingual-MiniLM-L12-v2
+EMBED_DIMENSION=384
+EMBED_BATCH_SIZE=64
+
+# KNN 설정
+KNN_ENGINE=lucene
+KNN_METHOD=hnsw
+KNN_SPACE_TYPE=cosinesimil
 ```
 
 ---
@@ -154,3 +171,4 @@ EMBED_MODEL_NAME=paraphrase-multilingual-MiniLM-L12-v2
 - 모델: `paraphrase-multilingual-MiniLM-L12-v2`
 - 벡터 차원: 384
 - 검색 방식: Hybrid Search (BM25 + KNN)
+- KNN 엔진: lucene / hnsw / cosinesimil
