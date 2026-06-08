@@ -104,7 +104,7 @@ INDEX_BODY = {
         'properties': {
             'employee_id':      {'type': 'keyword'},
             'department':       {'type': 'keyword'},
-            'position':         {'type': 'keyword'},
+            'job_grade':        {'type': 'keyword'},
             'embedding_text':   {'type': 'text', 'analyzer': 'korean_analyzer'},
             'embedding_vector': {
                 'type': 'knn_vector',
@@ -211,7 +211,7 @@ def load_data(client, model):
             metas.append({
                 'emp_id':     emp_id,
                 'department': common.get('부서', ''),
-                'position':   common.get('직급', ''),
+                'job_grade':  common.get('직급', ''),
             })
 
         # 실시간 임베딩 생성 (배치 64개씩)
@@ -226,7 +226,7 @@ def load_data(client, model):
                 '_source': {
                     'employee_id':      meta['emp_id'],
                     'department':       meta['department'],
-                    'position':         meta['position'],
+                    'job_grade':        meta['job_grade'],
                     'embedding_text':   texts[i],
                     'embedding_vector': vectors[i].tolist(),
                 },
