@@ -20,6 +20,7 @@ OPENSEARCH_HOME     = Path(os.getenv('OPENSEARCH_HOME', str(BASE_DIR / 'opensear
 LAST_INDEXED_FILE   = Path(__file__).resolve().parent / 'last_indexed.txt'
 LAST_DICT_HASH_FILE = Path(__file__).resolve().parent / 'last_dict_hash.txt'
 USER_DICT_FILE      = BASE_DIR / 'user_dictionary.txt'
+SYNONYM_FILE        = BASE_DIR / 'synonym.txt'
 
 # ── OpenSearch 연결 설정 ────────────────────────────────────────────────────────
 OPENSEARCH_HOST         = os.getenv('OPENSEARCH_HOST', 'localhost')
@@ -156,10 +157,17 @@ def build_index_body(security_level: int) -> dict:
                         'user_dictionary': 'user_dictionary.txt',
                     }
                 },
+                'filter': {
+                    'synonym_filter': {
+                        'type': 'synonym',
+                        'synonyms_path': 'synonym.txt',
+                    }
+                },
                 'analyzer': {
                     'korean_analyzer': {
                         'type': 'custom',
                         'tokenizer': 'nori_tokenizer',
+                        'filter': ['synonym_filter'],
                     }
                 }
             },
@@ -192,15 +200,13 @@ def build_index_body(security_level: int) -> dict:
 
 
 def ensure_user_dictionary():
-    src = BASE_DIR / 'user_dictionary.txt'
-    dst = OPENSEARCH_HOME / 'config' / 'user_dictionary.txt'
-
-    if not src.exists():
-        print('user_dictionary.txt 파일이 없습니다. 건너뜀')
-        return
-
-    shutil.copy(src, dst)
-    print(f'사용자 정의 사전 복사 완료: {dst}')
+    for src, filename in [(USER_DICT_FILE, 'user_dictionary.txt'), (SYNONYM_FILE, 'synonym.txt')]:
+        dst = OPENSEARCH_HOME / 'config' / filename
+        if not src.exists():
+            print(f'{filename} 파일이 없습니다. 건너뜀')
+            continue
+        shutil.copy(src, dst)
+        print(f'복사 완료: {dst}')
 
 
 def ensure_nori_plugin(client):
