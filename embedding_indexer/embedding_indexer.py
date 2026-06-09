@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import shutil
+import hashlib
 import zipfile
 import urllib.request
 from pathlib import Path
@@ -16,12 +18,14 @@ BASE_DIR            = Path(__file__).resolve().parent.parent
 INPUT_DIR           = Path(os.getenv('INPUT_DIR', str(BASE_DIR / 'Chunking' / 'output')))
 OPENSEARCH_HOME     = Path(os.getenv('OPENSEARCH_HOME', str(BASE_DIR / 'opensearch-3.3.2'))).resolve()
 LAST_INDEXED_FILE   = Path(__file__).resolve().parent / 'last_indexed.txt'
+LAST_DICT_HASH_FILE = Path(__file__).resolve().parent / 'last_dict_hash.txt'
+USER_DICT_FILE      = BASE_DIR / 'user_dictionary.txt'
 
 # ── OpenSearch 연결 설정 ────────────────────────────────────────────────────────
 OPENSEARCH_HOST         = os.getenv('OPENSEARCH_HOST', 'localhost')
 OPENSEARCH_PORT         = int(os.getenv('OPENSEARCH_PORT', 9200))
-OPENSEARCH_USER         = os.getenv('OPENSEARCH_USER', 'admin')
-OPENSEARCH_PASSWORD     = os.getenv('OPENSEARCH_PASSWORD', 'Admin1234!')
+OPENSEARCH_USER         = os.environ['OPENSEARCH_USER']
+OPENSEARCH_PASSWORD     = os.environ['OPENSEARCH_PASSWORD']
 OPENSEARCH_USE_SSL      = os.getenv('OPENSEARCH_USE_SSL', 'true').lower() == 'true'
 OPENSEARCH_VERIFY_CERTS = os.getenv('OPENSEARCH_VERIFY_CERTS', 'false').lower() == 'true'
 
@@ -112,6 +116,23 @@ ALL_FIELDS = sorted(
 )
 
 
+# ── 사용자 사전 변경 감지 ──────────────────────────────────────────────────────
+def get_dict_hash() -> str:
+    if not USER_DICT_FILE.exists():
+        return ''
+    return hashlib.md5(USER_DICT_FILE.read_bytes()).hexdigest()
+
+
+def read_last_dict_hash() -> str:
+    if not LAST_DICT_HASH_FILE.exists():
+        return ''
+    return LAST_DICT_HASH_FILE.read_text(encoding='utf-8').strip()
+
+
+def write_last_dict_hash(hash_value: str):
+    LAST_DICT_HASH_FILE.write_text(hash_value, encoding='utf-8')
+
+
 # ── 마지막 인덱싱 시간 관리 ────────────────────────────────────────────────────
 def read_last_indexed():
     if not LAST_INDEXED_FILE.exists():
@@ -129,6 +150,12 @@ def build_index_body(security_level: int) -> dict:
         'settings': {
             'index': {'knn': True},
             'analysis': {
+                'tokenizer': {
+                    'nori_tokenizer': {
+                        'type': 'nori_tokenizer',
+                        'user_dictionary': 'user_dictionary.txt',
+                    }
+                },
                 'analyzer': {
                     'korean_analyzer': {
                         'type': 'custom',
@@ -162,6 +189,18 @@ def build_index_body(security_level: int) -> dict:
             }
         },
     }
+
+
+def ensure_user_dictionary():
+    src = BASE_DIR / 'user_dictionary.txt'
+    dst = OPENSEARCH_HOME / 'config' / 'user_dictionary.txt'
+
+    if not src.exists():
+        print('user_dictionary.txt 파일이 없습니다. 건너뜀')
+        return
+
+    shutil.copy(src, dst)
+    print(f'사용자 정의 사전 복사 완료: {dst}')
 
 
 def ensure_nori_plugin(client):
@@ -210,12 +249,27 @@ def build_filtered_text(parsed, fields):
 
 def create_indices(client):
     print('=== 인덱스 생성 ===')
+
+    current_hash = get_dict_hash()
+    last_hash    = read_last_dict_hash()
+    dict_changed = current_hash != last_hash
+
+    if dict_changed:
+        print('  사용자 사전 변경 감지 → 기존 인덱스 삭제 후 재생성')
+        for name in INDEX_CONFIG:
+            if client.indices.exists(index=name):
+                client.indices.delete(index=name)
+                print(f'  삭제: {name}')
+
     for name, config in INDEX_CONFIG.items():
         if client.indices.exists(index=name):
             print(f'  이미 존재: {name}  (건너뜀)')
             continue
         client.indices.create(index=name, body=build_index_body(config['security_level']))
         print(f'  생성 완료: {name}  (security_level={config["security_level"]})')
+
+    if dict_changed:
+        write_last_dict_hash(current_hash)
 
 
 def get_existing_employee_ids(client, index_name):
@@ -352,6 +406,7 @@ def main():
         ssl_show_warn=False,
     )
 
+    ensure_user_dictionary()
     ensure_nori_plugin(client)
 
     last_indexed = read_last_indexed()
