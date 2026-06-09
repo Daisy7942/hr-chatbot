@@ -172,3 +172,22 @@ def extract_department_or_team(question: str) -> str | None:
             return name
 
     return None
+
+def extract_employee_id(question: str) -> str | None:
+    """
+    질문에서 사번 형태를 추출한다.
+
+    예:
+    - EMP0001 부서 알려줘 -> EMP0001
+    - emp0609 연봉 알려줘 -> EMP0609
+    """
+
+    if not question:
+        return None
+
+    match = re.search(r"EMP\d+", question.upper())
+
+    if match:
+        return match.group()
+
+    return None

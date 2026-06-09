@@ -8,6 +8,7 @@ from app.services.question_service import (
     is_self_question,
     classify_org_question,
     extract_department_or_team,
+    extract_employee_id,
 )
 
 from app.services.hybrid_search_service import (
@@ -204,7 +205,8 @@ def rag_chat(request: RagChatRequest):
 
     if is_self:
         search_employee_id = employee_id
-
+    else:
+        search_employee_id = extract_employee_id(request.question)
 
     # =========================
     # 8. 검색에 사용할 권한 레벨 결정
@@ -318,7 +320,7 @@ def rag_chat(request: RagChatRequest):
     if org_question_type == "manager_search":
         return {
             "success": False,
-            "answer": "현재 데이터에는 팀장 여부를 판단할 수 있는 필드가 없습니다. 부서, 팀, 직급 정보는 조회할 수 있지만 팀장 여부는 확인할 수 없습니다.",
+            "answer": "현재 데이터에는 팀장 여부를 판단할 수 없습니다. 부서, 팀, 직급 정보는 조회할 수 있지만 팀장 여부는 확인할 수 없습니다.",
             "permission": {
                 "allowed": True,
                 "employee_id": employee_id,
@@ -415,45 +417,98 @@ def rag_chat(request: RagChatRequest):
 
 def get_required_level(question: str) -> int:
     """
-    질문에 포함된 키워드를 기준으로 필요한 권한 레벨을 간단히 판단한다.
+    질문에 포함된 키워드를 기준으로 필요한 권한 레벨을 판단한다.
 
-    실제 접근 제어는 OpenSearch 검색 대상 인덱스 제한과
-    검색 필터를 통해 수행한다.
-
-    이 함수는 민감 정보 요청을 사전에 차단하기 위한 보조 검증이다.
+    1레벨: 일반 기본 정보
+    2레벨: 성과/평가 정보
+    3레벨: 주소/연락처/계좌/급여/연봉 등 민감 정보
     """
 
-    # 3레벨 권한이 필요한 민감 정보 키워드
     level_3_keywords = [
         "주소",
+        "거주지",
+        "사는 곳",
+        "사는곳",
+        "어디 살아",
+        "어디살아",
+        "자택",
         "주민번호",
         "주민등록번호",
+        "전화번호",
+        "연락처",
+        "휴대폰",
+        "핸드폰",
         "계좌번호",
+        "계좌",
+        "은행",
+        "연봉",
+        "급여",
+        "월급",
+        "받는 돈",
+        "받는돈",
+        "보상",
+        "보수",
+        "수당",
         "징계",
         "퇴직",
     ]
 
-    # 2레벨 권한이 필요한 정보 키워드
     level_2_keywords = [
-        "연봉",
-        "급여",
         "성과",
         "평가",
+        "고과",
+        "점수",
         "TOEIC",
         "토익",
         "자격증",
         "포상",
+        "수상",
     ]
 
-    # 3레벨 키워드가 질문에 있으면 3 반환
+    level_1_keywords = [
+        "이름",
+        "마케팅부",
+        "기획부",
+        "인사부",
+        "개발부",
+        "영업부",
+        "재무부",
+        "마케팅팀",
+        "기획팀",
+        "인사팀",
+        "개발팀",
+        "영업팀",
+        "재무팀",
+        "부서",
+        "팀",
+        "직급",
+        "직책",
+        "사원",
+        "대리",
+        "과장",
+        "차장",
+        "부장",
+        "팀원",
+        "팀장",
+        "입사일",
+        "이메일",
+        "인원",
+        "집계",
+    ]
+
     for keyword in level_3_keywords:
         if keyword in question:
             return 3
 
-    # 2레벨 키워드가 질문에 있으면 2 반환
+    if "집" in question and not any(word in question for word in ["집계", "집중", "모집"]):
+        return 3
+
     for keyword in level_2_keywords:
         if keyword in question:
             return 2
 
-    # 일반 기본 정보는 1레벨로 판단
+    for keyword in level_1_keywords:
+        if keyword in question:
+            return 1
+
     return 1
