@@ -402,10 +402,6 @@ def validate_edu(df):
         if univ in ('nan', 'NaN'):
             univ = ''
         emp_id = df.at[row, '사원번호']
-        if edu == '대학원졸':
-            log(row, emp_id, '학력', edu, '대학원졸 허용 안 함')
-            edu = '미입력'
-            df.at[row, '학력'] = '미입력'
         if not edu or edu == '미입력':
             if univ and univ != '미입력':
                 edu = '전문대졸' if '전문' in univ else '대졸'
@@ -418,18 +414,16 @@ def validate_edu(df):
             if univ:
                 log(row, emp_id, '출신대학', univ, '고졸인데 출신대학 존재 → 삭제')
                 df.at[row, '출신대학'] = ''
-        elif edu in ('대졸', '전문대졸') and '출신대학' in df.columns:
+        elif edu in ('대졸', '전문대졸', '대학원졸') and '출신대학' in df.columns:
             if not univ:
                 log(row, emp_id, '출신대학', univ, '결측')
                 df.at[row, '출신대학'] = '미입력'
-            else:
-                is_junior = '전문' in univ
-                if edu == '전문대졸' and not is_junior:
-                    log(row, emp_id, '출신대학', univ, '학력=전문대졸인데 일반대학교명')
-                    df.at[row, '출신대학'] = '미입력'
-                elif edu == '대졸' and is_junior:
-                    log(row, emp_id, '출신대학', univ, '학력=대졸인데 전문대학교명')
-                    df.at[row, '출신대학'] = '미입력'
+            elif edu == '전문대졸' and '전문' not in univ:
+                log(row, emp_id, '출신대학', univ, '학력=전문대졸인데 일반대학교명')
+                df.at[row, '출신대학'] = '미입력'
+            elif edu == '대졸' and '전문' in univ:
+                log(row, emp_id, '출신대학', univ, '학력=대졸인데 전문대학교명')
+                df.at[row, '출신대학'] = '미입력'
 
 
 def validate_career(df):

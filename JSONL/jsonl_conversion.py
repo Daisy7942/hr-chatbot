@@ -144,7 +144,7 @@ for source_name, df in dfs.items():
 
                 record['changed'] = old.get('changed', [])
 
-                skip = {'embedding_vector', 'embedding_text', 'timestamp', 'changed'}
+                skip = {'embedding_vector', 'timestamp', 'changed'}
                 new_fields = []
                 for field, new_val in record.items():
                     if field in skip:
