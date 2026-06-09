@@ -425,6 +425,13 @@ def search_bm25(question, permission_level, employee_id=None, size=5, indices=No
 # =========================
 
 
+def cosine_similarity(vec1, vec2):
+    dot = sum(a * b for a, b in zip(vec1, vec2))
+    norm_a = sum(a * a for a in vec1) ** 0.5
+    norm_b = sum(b * b for b in vec2) ** 0.5
+    return dot / (norm_a * norm_b + 1e-9)
+
+
 def search_vector(question, question_vector, permission_level, employee_id=None, size=5, indices=None):
     """
     embedding_vector 필드를 대상으로 벡터 유사도 검색을 수행한다.
@@ -440,37 +447,69 @@ def search_vector(question, question_vector, permission_level, employee_id=None,
         print("접근 가능한 인덱스가 없습니다.")
         return []
 
-    # OpenSearch k-NN 벡터 검색 쿼리
+    target_name = extract_employee_name(question)
+
+    if target_name:
+        candidate_query = {
+            "size": max(size * 20, 50),
+            "query": {
+                "bool": {
+                    "should": [
+                        {"term": {"employee_name": target_name}},
+                        {"match_phrase": {"embedding_text": target_name}},
+                    ],
+                    "minimum_should_match": 1,
+                }
+            },
+        }
+
+        response = client.search(index=indices, body=candidate_query)
+        candidate_hits = response["hits"]["hits"]
+
+        if candidate_hits:
+            ranked_hits = []
+            for hit in candidate_hits:
+                embedding_vector = hit.get("_source", {}).get("embedding_vector")
+                if not embedding_vector:
+                    continue
+                score = cosine_similarity(question_vector, embedding_vector)
+                ranked_hits.append((score, hit))
+
+            ranked_hits.sort(key=lambda item: item[0], reverse=True)
+            return [hit for score, hit in ranked_hits[:size]]
+
+    expanded_k = max(size * 10, 50)
     query = {
-        "size": size,
+        "size": expanded_k,
         "query": {
-            "bool": {
-                "filter": [],
-                # must 안에서 embedding_vector와 질문 벡터를 비교한다.
-                "must": [
-                    {
-                        "knn": {
-                            "embedding_vector": {"vector": question_vector, "k": size}
-                        }
-                    }
-                ],
+            "knn": {
+                "embedding_vector": {"vector": question_vector, "k": expanded_k}
             }
         },
     }
 
-    # employee_id가 있으면 해당 사번 문서만 검색한다.
-    if employee_id:
-        query["query"]["bool"]["filter"].append({"term": {"employee_id": employee_id}})
-
-    
-
-    # OpenSearch에 벡터 검색 요청을 보낸다.
     response = client.search(
         index=indices,
         body=query,
     )
 
-    return response["hits"]["hits"]
+    hits = response["hits"]["hits"]
+
+    if employee_id:
+        hits = [
+            hit
+            for hit in hits
+            if hit.get("_source", {}).get("employee_id") == employee_id
+        ]
+    elif target_name:
+        hits = [
+            hit
+            for hit in hits
+            if target_name in hit.get("_source", {}).get("employee_name", "")
+            or target_name in hit.get("_source", {}).get("embedding_text", "")
+        ]
+
+    return hits[:size]
 
 
 # =========================
