@@ -271,8 +271,12 @@ def create_indices(client):
         if client.indices.exists(index=name):
             print(f'  이미 존재: {name}  (건너뜀)')
             continue
-        client.indices.create(index=name, body=build_index_body(config['security_level']))
-        print(f'  생성 완료: {name}  (security_level={config["security_level"]})')
+        try:
+            client.indices.create(index=name, body=build_index_body(config['security_level']))
+            print(f'  생성 완료: {name}  (security_level={config["security_level"]})')
+        except Exception as e:
+            print(f'  인덱스 생성 실패: {name}  → {e}')
+            raise SystemExit(1)
 
     if dict_changed:
         write_last_dict_hash(current_hash)
@@ -411,6 +415,13 @@ def main():
         verify_certs=OPENSEARCH_VERIFY_CERTS,
         ssl_show_warn=False,
     )
+
+    try:
+        client.info()
+    except Exception as e:
+        print(f'OpenSearch 연결 실패 → {e}')
+        print(f'OpenSearch가 실행 중인지 확인해주세요. ({OPENSEARCH_HOST}:{OPENSEARCH_PORT})')
+        raise SystemExit(1)
 
     ensure_user_dictionary()
     ensure_nori_plugin(client)

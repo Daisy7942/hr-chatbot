@@ -719,6 +719,7 @@ def validate_qual(df):
                 log(row, df.at[row, '사원번호'], 'TOEIC점수', raw, '숫자 변환 불가')
                 df.at[row, 'TOEIC점수'] = '미입력'
                 continue
+            df.at[row, 'TOEIC점수'] = toeic
             if not (MIN_TOEIC <= toeic <= MAX_TOEIC):
                 log(row, df.at[row, '사원번호'], 'TOEIC점수', raw, f'범위 초과 ({MIN_TOEIC}~{MAX_TOEIC})')
                 df.at[row, 'TOEIC점수'] = '미입력'

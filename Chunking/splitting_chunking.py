@@ -11,7 +11,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 load_dotenv()
 
-INPUT_DIR  = Path(os.getenv('INPUT_DIR',  str(BASE_DIR / '../JSONL/output')))
+INPUT_DIR  = Path(os.getenv('INPUT_DIR',  str(BASE_DIR.parent / 'JSONL' / 'output')))
 OUTPUT_DIR = Path(os.getenv('OUTPUT_DIR', str(BASE_DIR / 'output')))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)

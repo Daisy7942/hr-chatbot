@@ -12,7 +12,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 load_dotenv()
 
-INPUT_DIR  = Path(os.getenv('INPUT_DIR',  str(BASE_DIR / '../Preprocessing/output')))
+INPUT_DIR  = Path(os.getenv('INPUT_DIR',  str(BASE_DIR.parent / 'Preprocessing' / 'output')))
 OUTPUT_DIR = Path(os.getenv('OUTPUT_DIR', str(BASE_DIR / 'output')))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -168,7 +168,6 @@ for source_name, df in dfs.items():
             f.write(json.dumps(record, ensure_ascii=False) + '\n')
 
     saved_files.append((out_path, len(rows)))
-    print(f'  저장: {out_path.name}  ({len(rows):,}건)')
 
 # ── 4. 저장 결과 확인 ──────────────────────────────────────────────────────────
 
@@ -178,3 +177,10 @@ for out_path, _ in saved_files:
     print(f'\n[{out_path.name}] 첫 번째 레코드:')
     print(json.dumps(sample, ensure_ascii=False, indent=2))
     print()
+
+print('=== 저장 완료 ===')
+total = 0
+for out_path, count in saved_files:
+    print(f'  {out_path.name}  ({count:,}건)')
+    total += count
+print(f'  총 {total:,}건')
