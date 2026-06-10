@@ -18,9 +18,9 @@ BASE_DIR            = Path(__file__).resolve().parent.parent
 INPUT_DIR           = Path(os.getenv('INPUT_DIR', str(BASE_DIR / 'Chunking' / 'output')))
 OPENSEARCH_HOME     = Path(os.getenv('OPENSEARCH_HOME', str(BASE_DIR / 'opensearch-3.3.2'))).resolve()
 LAST_INDEXED_FILE   = Path(__file__).resolve().parent / 'last_indexed.txt'
-LAST_DICT_HASH_FILE = Path(__file__).resolve().parent / 'last_dict_hash.txt'
-USER_DICT_FILE      = BASE_DIR / 'user_dictionary.txt'
-SYNONYM_FILE        = BASE_DIR / 'synonym.txt'
+LAST_USER_DICT_FILE = Path(__file__).resolve().parent / 'last_user_dictionary.txt'
+USER_DICT_FILE      = Path(__file__).resolve().parent / 'user_dictionary.txt'
+SYNONYM_FILE        = Path(__file__).resolve().parent / 'synonym.txt'
 
 # ── OpenSearch 연결 설정 ────────────────────────────────────────────────────────
 OPENSEARCH_HOST         = os.getenv('OPENSEARCH_HOST', 'localhost')
@@ -125,13 +125,13 @@ def get_dict_hash() -> str:
 
 
 def read_last_dict_hash() -> str:
-    if not LAST_DICT_HASH_FILE.exists():
+    if not LAST_USER_DICT_FILE.exists():
         return ''
-    return LAST_DICT_HASH_FILE.read_text(encoding='utf-8').strip()
+    return LAST_USER_DICT_FILE.read_text(encoding='utf-8').strip()
 
 
 def write_last_dict_hash(hash_value: str):
-    LAST_DICT_HASH_FILE.write_text(hash_value, encoding='utf-8')
+    LAST_USER_DICT_FILE.write_text(hash_value, encoding='utf-8')
 
 
 # ── 마지막 인덱싱 시간 관리 ────────────────────────────────────────────────────
