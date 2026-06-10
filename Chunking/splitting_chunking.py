@@ -7,10 +7,12 @@ from langchain_core.documents import Document
 
 print('라이브러리 로딩 완료!')
 
+BASE_DIR = Path(__file__).resolve().parent
+
 load_dotenv()
 
-INPUT_DIR  = Path(os.getenv('INPUT_DIR',  '../JSONL/output'))
-OUTPUT_DIR = Path(os.getenv('OUTPUT_DIR', 'output'))
+INPUT_DIR  = Path(os.getenv('INPUT_DIR',  str(BASE_DIR / '../JSONL/output')))
+OUTPUT_DIR = Path(os.getenv('OUTPUT_DIR', str(BASE_DIR / 'output')))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 

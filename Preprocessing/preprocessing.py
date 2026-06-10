@@ -490,6 +490,9 @@ def validate_dept(df):
             drop_rows.add(row)
     if '팀' in df.columns:
         for row in df.index:
+            grade = str(df.at[row, '직급']).strip() if '직급' in df.columns and df.at[row, '직급'] else ''
+            if grade in ('사장', '이사'):
+                continue
             dept = str(df.at[row, '부서']).strip()
             team = str(df.at[row, '팀']).strip() if df.at[row, '팀'] else ''
             if team in ('nan', 'NaN'):
@@ -697,30 +700,9 @@ def validate_perf(df):
             if grade_val in ('nan', 'NaN'):
                 grade_val = ''
             emp_id = df.at[row, '사원번호']
-            hire_date = valid_hire.get(row)
-            hire_year = hire_date.year if hire_date else None
-            retire_date_str = ''
-            if '퇴직일자' in df.columns and df.at[row, '퇴직일자']:
-                retire_date_str = str(df.at[row, '퇴직일자']).strip()
-                if retire_date_str in ('nan', 'NaN'):
-                    retire_date_str = ''
-            retire_date = parse_date(retire_date_str)
-            retire_year = retire_date.year if retire_date else None
-            if hire_year and year < hire_year:
-                df.at[row, col] = ''
-                continue
-            if retire_year and year > retire_year:
-                df.at[row, col] = ''
-                continue
-            if hire_year and year == hire_year:
-                if grade_val and grade_val not in PERF_GRADES:
-                    log(row, emp_id, col, grade_val, '고정값 외')
-                    df.at[row, col] = '미입력'
-                continue
             if not grade_val:
-                log(row, emp_id, col, grade_val, '재직 기간 내 결측')
-                df.at[row, col] = '미입력'
-            elif grade_val not in PERF_GRADES:
+                continue
+            if grade_val not in PERF_GRADES:
                 log(row, emp_id, col, grade_val, '고정값 외')
                 df.at[row, col] = '미입력'
 
@@ -732,7 +714,7 @@ def validate_qual(df):
             if not toeic_str or toeic_str in ('nan', 'NaN'):
                 continue
             try:
-                toeic = int(raw)
+                toeic = int(float(raw))
             except Exception:
                 log(row, df.at[row, '사원번호'], 'TOEIC점수', raw, '숫자 변환 불가')
                 df.at[row, 'TOEIC점수'] = '미입력'
@@ -816,11 +798,10 @@ for source_name, df in dfs.items():
     print(f'  저장: {out_path.name}  ({len(df_clean):,}행 / 제거 {len(drop_rows)}행)')
 
 error_path = OUTPUT_DIR / 'error.log'
-if all_errors:
-    pd.DataFrame(all_errors)[['파일명', '행', '사원번호', '컬럼', '원본값', '사유']].to_csv(
-        error_path, index=False, encoding='utf-8-sig'
-    )
-    print(f'\n에러 로그: {error_path.name}  (총 {len(all_errors):,}건)')
+pd.DataFrame(all_errors, columns=['파일명', '행', '사원번호', '컬럼', '원본값', '사유']).to_csv(
+    error_path, index=False, encoding='utf-8-sig'
+)
+print(f'\n에러 로그: {error_path.name}  (총 {len(all_errors):,}건)')
 
 print('=' * 60)
 print('통합인사정보 데이터 전처리 완료')
