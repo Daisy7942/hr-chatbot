@@ -6,21 +6,16 @@ from app.services.llm_service import generate_answer
 
 from app.services.question_service import (
     is_self_question,
-    classify_org_question,
-    extract_department_or_team,
     extract_employee_id,
 )
 
 from app.services.hybrid_search_service import (
     build_context,
+    build_full_list_answer,
+    extract_embedding_text_field,
     get_user_permission_level,
     search_hybrid,
-    get_department_list,
-    search_employees_by_department_or_team,
-    format_employee_list_answer,
-    make_sources,
 )
-
 
 # =========================
 # FastAPI 앱 생성
@@ -226,41 +221,15 @@ def rag_chat(request: RagChatRequest):
     if is_self:
         search_permission_level = max(permission_level, required_level)
 
-    # =========================
-    # 9. 조직/부서/팀/직책 질문 직접 처리
-    # =========================
-    # "내 부서 알려줘" 같은 본인 질문은 기존 RAG 검색으로 보낸다.
-    # "부서 목록", "마케팅부 직원", "개발팀 직원", "팀장 누구야" 같은 조직 질문만 직접 처리한다.
+    list_answer = build_full_list_answer(
+        question=request.question,
+        permission_level=search_permission_level,
+    )
 
-    org_question_type = None
-
-    if not is_self:
-        org_question_type = classify_org_question(request.question)
-
-    # =========================
-    # 9-1. 부서 목록 질문 처리
-    # =========================
-
-    if org_question_type == "department_list":
-        departments = get_department_list(search_permission_level)
-
-        if not departments:
-            return {
-                "success": False,
-                "answer": "조회 가능한 부서 목록이 없습니다.",
-                "permission": {
-                    "allowed": True,
-                    "employee_id": employee_id,
-                    "permission_level": permission_level,
-                    "required_level": required_level,
-                },
-                "sources": [],
-                "model_type": "direct-search",
-            }
-
+    if list_answer:
         return {
             "success": True,
-            "answer": "조회 가능한 부서 목록은 다음과 같습니다: " + ", ".join(departments),
+            "answer": list_answer,
             "permission": {
                 "allowed": True,
                 "employee_id": employee_id,
@@ -268,80 +237,23 @@ def rag_chat(request: RagChatRequest):
                 "required_level": required_level,
             },
             "sources": [],
-            "model_type": "direct-search",
-        }
-
-    # =========================
-    # 9-2. 특정 부서/팀 직원 조회
-    # =========================
-
-    if org_question_type == "department_employee_search":
-        department_or_team = extract_department_or_team(request.question)
-
-        if not department_or_team:
-            return {
-                "success": False,
-                "answer": "어느 부서 또는 팀의 직원을 조회할지 다시 입력해 주세요. 예: 마케팅부 직원 알려줘",
-                "permission": {
-                    "allowed": True,
-                    "employee_id": employee_id,
-                    "permission_level": permission_level,
-                    "required_level": required_level,
-                },
-                "sources": [],
-                "model_type": "direct-search",
-            }
-
-        search_hits = search_employees_by_department_or_team(
-            department_or_team=department_or_team,
-            permission_level=search_permission_level,
-            size=20,
-        )
-
-        return {
-            "success": bool(search_hits),
-            "answer": format_employee_list_answer(search_hits),
-            "permission": {
-                "allowed": True,
-                "employee_id": employee_id,
-                "permission_level": permission_level,
-                "required_level": required_level,
-            },
-            "sources": make_sources(search_hits),
-            "model_type": "direct-search",
-        }
-
-    # =========================
-    # 9-3. 팀장/상사 질문 처리
-    # =========================
-    # 현재 데이터에는 팀장 여부를 판단할 수 있는 필드가 없다.
-    # 부장/과장을 팀장으로 추측하지 않는다.
-
-    if org_question_type == "manager_search":
-        return {
-            "success": False,
-            "answer": "현재 데이터에는 팀장 여부를 판단할 수 없습니다. 부서, 팀, 직급 정보는 조회할 수 있지만 팀장 여부는 확인할 수 없습니다.",
-            "permission": {
-                "allowed": True,
-                "employee_id": employee_id,
-                "permission_level": permission_level,
-                "required_level": required_level,
-            },
-            "sources": [],
-            "model_type": "direct-search",
+            "model_type": "list-aggregation",
         }
 
     # =========================
     # 10. 일반 RAG 검색 실행
     # =========================
 
+    is_list_question = any(word in request.question for word in ["종류", "목록", "리스트"])
+
+    search_size = 300 if is_list_question else 20
+
     search_hits = search_hybrid(
         question=request.question,
         permission_level=search_permission_level,
         employee_id=search_employee_id,
-        size=5,
+        size=search_size,
     )
-
     if not search_hits:
         return {
             "success": False,
@@ -360,7 +272,7 @@ def rag_chat(request: RagChatRequest):
     # 11. 검색 결과를 LLM Context로 변환
     # =========================
 
-    context = build_context(search_hits)
+    context = build_context(search_hits, request.question)
 
     # =========================
     # 12. gemma3:4b 답변 생성
@@ -379,6 +291,15 @@ def rag_chat(request: RagChatRequest):
 
     for hit in search_hits:
         source = hit.get("_source", {})
+        embedding_text = source.get("embedding_text", "")
+
+        team = extract_embedding_text_field(embedding_text, "팀")
+        position = extract_embedding_text_field(embedding_text, "직책")
+        email = extract_embedding_text_field(embedding_text, "이메일")
+        phone = extract_embedding_text_field(embedding_text, "전화번호")
+        address = extract_embedding_text_field(embedding_text, "주소")
+        salary = extract_embedding_text_field(embedding_text, "연봉")
+        account = extract_embedding_text_field(embedding_text, "계좌번호")
 
         sources.append(
             {
@@ -387,8 +308,20 @@ def rag_chat(request: RagChatRequest):
                 "employee_id": source.get("employee_id"),
                 "employee_name": source.get("employee_name"),
                 "department": source.get("department"),
-                "position": source.get("position"),
                 "job_grade": source.get("job_grade"),
+
+                # embedding_text에서 추출한 상세값
+                "team": team,
+                "position": position,
+                "email": email,
+                "phone": phone,
+                "address": address,
+                "salary": salary,
+                "account": account,
+
+                # 원문 확인용
+                "embedding_text": embedding_text,
+
                 "score": hit.get("_score"),
             }
         )
