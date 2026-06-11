@@ -101,7 +101,7 @@ def build_embedding_text(row, info):
             parts.append(f'{key}: {val}')
             seen_keys.append(key)
 
-    return ' '.join(parts)
+    return '\n'.join(parts)
 
 
 def to_record(row, source_name):
