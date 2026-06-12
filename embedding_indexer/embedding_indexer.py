@@ -55,7 +55,6 @@ INDEX_CONFIG = {
         'security_level': 2,
         'source': '기본인사정보',
         'fields': [
-            '이름', '부서', '직급',
             '생년월일', '병역', '학력', '출신대학', '학점',
             '전화번호', '이전직장명', '이전최종직급', '이전담당업무',
         ],
@@ -64,7 +63,6 @@ INDEX_CONFIG = {
         'security_level': 3,
         'source': '기본인사정보',
         'fields': [
-            '이름', '부서', '직급',
             '주민등록번호', '주소', '퇴직구분', '퇴직일자',
         ],
     },
@@ -72,7 +70,6 @@ INDEX_CONFIG = {
         'security_level': 2,
         'source': '역량성과',
         'fields': [
-            '이름', '부서', '직급',
             '성과점수',
             '인사고과_2020', '인사고과_2021', '인사고과_2022',
             '인사고과_2023', '인사고과_2024',
@@ -83,7 +80,6 @@ INDEX_CONFIG = {
         'security_level': 3,
         'source': '역량성과',
         'fields': [
-            '이름', '부서', '직급',
             '징계이력', '징계사유', '자격증수당여부',
         ],
     },
@@ -91,7 +87,6 @@ INDEX_CONFIG = {
         'security_level': 2,
         'source': '급여정보',
         'fields': [
-            '이름', '부서', '직급',
             '잔업시간', '미사용휴가일수',
         ],
     },
@@ -99,16 +94,10 @@ INDEX_CONFIG = {
         'security_level': 3,
         'source': '급여정보',
         'fields': [
-            '이름', '부서', '직급',
             '연봉', '급여은행', '계좌번호', '4대보험가입여부',
         ],
     },
 }
-
-# source → 해당 인덱스 목록
-SOURCE_TO_INDICES = {}
-for idx_name, cfg in INDEX_CONFIG.items():
-    SOURCE_TO_INDICES.setdefault(cfg['source'], []).append(idx_name)
 
 # 전체 필드 목록 (embedding_text 파싱용)
 ALL_FIELDS = sorted(
@@ -338,17 +327,11 @@ def load_data(client, model, last_indexed):
         if not records:
             continue
 
-        source_name = records[0].get('source', '')
-        index_names = SOURCE_TO_INDICES.get(source_name)
+        print(f'\n  {jsonl_file.name}  총 {len(records):,}건')
 
-        if not index_names:
-            print(f'  건너뜀: {jsonl_file.name}  (source={source_name})')
-            continue
-
-        print(f'\n  {jsonl_file.name}  ({source_name})  총 {len(records):,}건')
-
-        for index_name in index_names:
-            fields = INDEX_CONFIG[index_name]['fields']
+        # 필드 기반 라우팅: 모든 인덱스 순회하면서 매칭되는 필드 있으면 적재
+        for index_name, cfg in INDEX_CONFIG.items():
+            fields = cfg['fields']
 
             existing_ids = get_existing_employee_ids(client, index_name)
 

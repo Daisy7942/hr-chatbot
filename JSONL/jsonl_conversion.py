@@ -83,23 +83,30 @@ def clean(val):
     return cleaned if cleaned not in MISSING_VALUES else ''
 
 
-def build_embedding_text(row, info):
-    fields = [
-        ('이름', info.get('이름', clean(row.get('이름', '')))),
-        ('부서', info.get('부서', clean(row.get('부서', '')))),
-        ('직급', info.get('직급', clean(row.get('직급', '')))),
-    ]
-    for field in EMBEDDING_FIELDS:
-        val = clean(str(row.get(field, '')))
-        if val:
-            fields.append((field, val))
-
-    seen_keys = []
+def build_embedding_text(row, info, source_name):
     parts = []
-    for key, val in fields:
-        if val and key not in seen_keys:
+    seen_keys = []
+
+    # 기본인사정보일 때만 이름/부서/직급 embedding_text에 포함
+    # (데이터구조정의서 기준: 이름/부서/직급은 hr_basic_1에만 적재)
+    if '기본인사정보' in source_name:
+        for key in ['이름', '부서', '직급']:
+            val = info.get(key) or clean(str(row.get(key, '')))
+            if not val:
+                val = '미입력'
             parts.append(f'{key}: {val}')
             seen_keys.append(key)
+
+    # 해당 CSV에 존재하는 필드만 처리 (없는 필드는 스킵)
+    for field in EMBEDDING_FIELDS:
+        if field not in row:
+            continue
+        val = clean(str(row[field]))
+        if not val:
+            val = '미입력'
+        if field not in seen_keys:
+            parts.append(f'{field}: {val}')
+            seen_keys.append(field)
 
     return '\n'.join(parts)
 
@@ -115,11 +122,10 @@ def to_record(row, source_name):
         'department_level': clean(row.get('부서레벨', '')) or info.get('부서레벨', ''),
         'job_grade':         info.get('직급', clean(row.get('직급', ''))),
         'job_grade_level':   clean(row.get('직급레벨', '')) or info.get('직급레벨', ''),
-        'embedding_text':   build_embedding_text(row, info),
-        'source':           source_name.replace('_정제', ''),
+        'embedding_text':   build_embedding_text(row, info, source_name),
+        'source':           source_name,
         'timestamp':        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'changed':          [],
-        'embedding_vector': [],
     }
 
 
