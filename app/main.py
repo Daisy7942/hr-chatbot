@@ -31,6 +31,10 @@ from app.services.question_analyzer_service import (
     analyze_question_to_tasks,
     normalize_tasks,
 )
+from app.services.session_service import (
+    resolve_question_with_memory,
+    update_memory_from_tasks,
+)
 from app.services.org_policy_service import (
     DEPARTMENTS,
     TEAMS,
@@ -607,6 +611,18 @@ def process_task(
             },
         }
 
+    has_explicit_target = any(
+        task.get(key)
+        for key in ["employee_name", "employee_id", "department", "team", "position"]
+    )
+
+    if (
+        intent == "single_lookup"
+        and not filters
+        and not has_explicit_target
+    ):
+        task["is_self"] = True
+
     is_self = bool(task.get("is_self", False))
 
     # LLM이 직원 이름을 못 뽑은 경우를 대비한 보정
@@ -949,15 +965,23 @@ def rag_chat(request: RagChatRequest):
             detail="계산된 permission_level이 유효하지 않습니다.",
         )
 
+    resolved_question = resolve_question_with_memory(
+        question=request.question,
+        requester_employee_id=employee_id,
+    )
+
+    if resolved_question != request.question:
+        print("[DEBUG] memory resolved question:", resolved_question)
+
     analyze_start_time = time.perf_counter()
-    analysis = analyze_question_to_tasks(request.question)
+    analysis = analyze_question_to_tasks(resolved_question)
     print(
         "[TIME] analyze_question_to_tasks:",
         f"{time.perf_counter() - analyze_start_time:.3f}s",
     )
 
     normalize_start_time = time.perf_counter()
-    tasks = normalize_tasks(analysis, request.question)
+    tasks = normalize_tasks(analysis, resolved_question)
     print(
         "[TIME] normalize_tasks:",
         f"{time.perf_counter() - normalize_start_time:.3f}s",
@@ -969,12 +993,17 @@ def rag_chat(request: RagChatRequest):
     task_results = [
         process_task(
             task=task,
-            original_question=request.question,
+            original_question=resolved_question,
             requester_employee_id=employee_id,
             permission_level=permission_level,
         )
         for task in tasks
     ]
+
+    update_memory_from_tasks(
+        requester_employee_id=employee_id,
+        tasks=tasks,
+    )
     print(
         "[TIME] all process_task:",
         f"{time.perf_counter() - tasks_start_time:.3f}s",
@@ -1011,5 +1040,6 @@ def rag_chat(request: RagChatRequest):
         },
         "tasks": tasks,
         "sources": sources,
+        "resolved_question": resolved_question,
         "model_type": "gemma3:4b",
     }

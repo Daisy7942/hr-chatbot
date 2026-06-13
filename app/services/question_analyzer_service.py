@@ -2,6 +2,11 @@ import json
 import re
 import requests
 
+from app.services.question_service import (
+    extract_employee_id,
+    extract_employee_name,
+    is_self_question,
+)
 from app.services.query_policy_service import (
     ALLOWED_FIELDS,
     ALLOWED_INTENTS,
@@ -92,6 +97,61 @@ def compact_text(text: str) -> str:
         return ""
 
     return re.sub(r"\s+", "", text)
+
+
+def build_fallback_analysis(question: str) -> dict:
+    """
+    LLM 응답 JSON이 깨졌을 때 사용하는 최소 fallback 분석기.
+
+    정상 경로는 LLM 분석 결과를 사용하고, 이 함수는 JSON 파싱 실패 시에만 사용한다.
+    """
+
+    compact_question = compact_text(question)
+    target_fields = []
+
+    keyword_to_field = [
+        (["주민등록번호", "주민번호"], "rrn"),
+        (["사원번호", "사번"], "employee_id"),
+        (["이메일", "메일"], "email"),
+        (["전화번호", "연락처", "휴대폰", "핸드폰"], "phone"),
+        (["주소"], "address"),
+        (["연봉"], "salary"),
+        (["부서"], "department"),
+        (["팀"], "team"),
+        (["직급"], "job_grade"),
+        (["직책"], "position"),
+        (["입사일"], "hire_date"),
+        (["계약형태"], "contract_type"),
+        (["성과점수"], "performance_score"),
+        (["평가", "고과", "인사고과"], "evaluation_2024"),
+    ]
+
+    for keywords, field in keyword_to_field:
+        if any(keyword in compact_question for keyword in keywords):
+            target_fields.append(field)
+
+    if not target_fields:
+        return {"tasks": [DEFAULT_TASK.copy()]}
+
+    employee_id = extract_employee_id(question)
+    employee_name = None if employee_id else extract_employee_name(question)
+    is_self = is_self_question(question)
+
+    return {
+        "tasks": [
+            {
+                "intent": "single_lookup",
+                "target_fields": target_fields,
+                "employee_name": employee_name,
+                "employee_id": employee_id,
+                "department": None,
+                "team": None,
+                "position": None,
+                "filters": [],
+                "is_self": is_self,
+            }
+        ]
+    }
 
 
 def find_known_value(question: str, values: list[str]) -> str | None:
@@ -300,6 +360,31 @@ def normalize_target_fields_by_question(
     return target_fields
 
 
+def normalize_employee_identity_fields(task: dict) -> tuple[str | None, str | None]:
+    """
+    LLM이 직원 이름을 employee_id에 넣은 경우를 보정한다.
+
+    employee_id는 EMP0001 같은 실제 사번만 허용한다.
+    그 외 값은 employee_name으로 옮긴다.
+    """
+
+    employee_name = task.get("employee_name")
+    employee_id = task.get("employee_id")
+
+    if employee_id:
+        employee_id_text = str(employee_id).strip()
+
+        if re.fullmatch(r"EMP\d+", employee_id_text.upper()):
+            return employee_name, employee_id_text.upper()
+
+        if not employee_name:
+            employee_name = employee_id_text
+
+        employee_id = None
+
+    return employee_name, employee_id
+
+
 def normalize_filters(raw_filters) -> list[dict]:
     """
     LLM이 반환한 filters를 안전한 형태로 정리한다.
@@ -499,6 +584,8 @@ filters:
 - 본인 정보를 묻는 경우 is_self를 true로 설정하세요.
 - 직원 이름이 있으면 employee_name에 넣으세요.
 - EMP0001 같은 실제 사번이 있으면 employee_id에 넣으세요.
+- employee_id에는 EMP0001 같은 실제 사번만 넣으세요.
+- 사람 이름을 employee_id에 넣지 마세요.
 - 사원번호/사번을 물으면 target_fields는 employee_id입니다.
 - 주민등록번호/주민번호를 물으면 target_fields는 rrn입니다.
 - 주민등록번호/주민번호를 employee_id로 분석하지 마세요.
@@ -820,7 +907,7 @@ filters:
                 "stream": False,
                 "options": {
                     "temperature": 0,
-                    "num_predict": 700,
+                    "num_predict": 1200,
                 },
             },
             timeout=180,
@@ -836,7 +923,7 @@ filters:
         except json.JSONDecodeError:
             print("[ERROR] question analyzer JSON decode failed")
             print("[DEBUG] raw_text:", raw_text)
-            return {"tasks": [DEFAULT_TASK.copy()]}
+            return build_fallback_analysis(question)
 
     except requests.exceptions.Timeout:
         print("[ERROR] question analyzer timeout")
@@ -981,7 +1068,7 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
         if filters and safe_fields == ["unknown"]:
             safe_fields = ["employee"]
 
-        employee_name = task.get("employee_name")
+        employee_name, employee_id = normalize_employee_identity_fields(task)
 
         if is_org_alias_text(employee_name):
             employee_name = None
@@ -991,7 +1078,7 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
                 "intent": intent,
                 "target_fields": safe_fields,
                 "employee_name": employee_name,
-                "employee_id": task.get("employee_id"),
+                "employee_id": employee_id,
                 "department": department,
                 "team": team,
                 "position": position,
