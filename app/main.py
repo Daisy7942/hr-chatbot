@@ -1,78 +1,67 @@
+import re
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from app.services.llm_service import generate_answer
-
 from app.services.question_service import (
-    is_self_question,
     extract_employee_id,
+    extract_employee_name,
 )
-
 from app.services.hybrid_search_service import (
+    ACCESSIBLE_INDICES,
     build_context,
-    build_full_list_answer,
-    extract_embedding_text_field,
+    filter_hits_with_answer_values,
+    get_allowed_field_value,
+    get_category_values,
     get_user_permission_level,
+    make_sources,
+    search_employees_by_conditions,
+    search_employees_by_department_or_team,
     search_hybrid,
 )
+from app.services.query_policy_service import (
+    FIELD_RULES,
+    get_max_required_level,
+    select_indices_by_fields,
+    split_fields_by_permission,
+)
+from app.services.question_analyzer_service import (
+    analyze_question_to_tasks,
+    normalize_tasks,
+)
+from app.services.org_policy_service import (
+    DEPARTMENTS,
+    TEAMS,
+    POSITIONS,
+)
 
-# =========================
-# FastAPI 앱 생성
-# =========================
 
 app = FastAPI(title="Durian HR RAG Chatbot")
 
 
-# =========================
-# LLM 단독 테스트 요청 모델
-# =========================
-
 class ChatRequest(BaseModel):
-    # 사용자가 입력한 질문
     question: str
 
-
-# =========================
-# RAG 챗봇 요청 모델
-# =========================
 
 class RagChatRequest(BaseModel):
-    # 사용자가 입력한 질문
     question: str
-
-    # 요청한 사용자의 사번
-    # 이 사번을 기준으로 권한 레벨을 자동 계산한다.
     employee_id: str
 
-
-# =========================
-# 기본 상태 확인 API
-# =========================
 
 @app.get("/")
 def root():
     return {"message": "Durian RAG API Running"}
 
 
-# =========================
-# LLM 단독 호출 API
-# =========================
-
 @app.post("/chat")
 def chat(request: ChatRequest):
-    """
-    RAG 검색 없이 gemma3:4b 모델만 단독으로 호출하는 테스트 API이다.
-    """
-
-    # 질문이 비어 있으면 예외 처리
     if not request.question or not request.question.strip():
         raise HTTPException(
             status_code=400,
             detail="질문을 입력해주세요.",
         )
 
-    # Ollama gemma3:4b 모델 호출
     response = requests.post(
         "http://localhost:11434/api/generate",
         json={
@@ -81,8 +70,6 @@ def chat(request: ChatRequest):
             "stream": False,
         },
     )
-
-    # Ollama 응답을 JSON으로 변환
     result = response.json()
 
     return {
@@ -92,356 +79,823 @@ def chat(request: ChatRequest):
     }
 
 
-# =========================
-# RAG 챗봇 API
-# =========================
+def unique_keep_order(items: list[str]) -> list[str]:
+    """
+    리스트 순서를 유지하면서 중복을 제거한다.
+    """
+
+    result = []
+
+    for item in items:
+        if item not in result:
+            result.append(item)
+
+    return result
+
+
+def build_denied_message(denied_fields: list[str]) -> str:
+    if not denied_fields:
+        return ""
+
+    labels = [
+        FIELD_RULES.get(field, {}).get("label", field)
+        for field in denied_fields
+    ]
+
+    return "접근 권한이 없어 제공할 수 없는 정보: " + ", ".join(labels)
+
+
+def build_category_answer(field_key: str, permission_level: int) -> str:
+    """
+    부서/팀/직급/직책 목록 질문에 대한 답변.
+
+    예:
+    - 부서 종류 알려줘
+    - 팀 목록 알려줘
+    """
+
+    values = get_category_values(field_key, permission_level)
+    label = FIELD_RULES.get(field_key, {}).get("label", field_key)
+
+    if not values:
+        return f"조회 가능한 {label} 목록이 없습니다."
+
+    return (
+        f"{label} 목록은 다음과 같습니다.\n"
+        + "\n".join([f"- {value}" for value in values])
+    )
+
+
+def normalize_task_org_values(task: dict) -> dict:
+    """
+    task 안의 department/team/position 값이 실제 목록에 있는지 검증한다.
+
+    예:
+    - department="채용팀"은 잘못된 값이므로 제거
+    - team="채용팀"은 정상 값이므로 유지
+    """
+
+    normalized_task = task.copy()
+
+    raw_department = normalized_task.get("department")
+    raw_team = normalized_task.get("team")
+    raw_position = normalized_task.get("position")
+
+    normalized_task["department"] = (
+        raw_department
+        if raw_department in DEPARTMENTS
+        else None
+    )
+
+    normalized_task["team"] = (
+        raw_team
+        if raw_team in TEAMS
+        else None
+    )
+
+    normalized_task["position"] = (
+        raw_position
+        if raw_position in POSITIONS
+        else None
+    )
+
+    return normalized_task
+
+
+def sanitize_filters(filters: list[dict]) -> list[dict]:
+    """
+    LLM이 만든 filters를 main.py에서도 한 번 더 안전하게 검증한다.
+
+    중요:
+    - department 값은 DEPARTMENTS에 있어야 한다.
+    - team 값은 TEAMS에 있어야 한다.
+    - position 값은 POSITIONS에 있어야 한다.
+    - FIELD_RULES에 없는 field는 버린다.
+    """
+
+    if not isinstance(filters, list):
+        return []
+
+    allowed_ops = {"eq", "contains", "gt", "gte", "lt", "lte", "between"}
+    safe_filters = []
+
+    for item in filters:
+        if not isinstance(item, dict):
+            continue
+
+        field = item.get("field")
+        op = item.get("op", "eq")
+        value = item.get("value")
+
+        if field not in FIELD_RULES:
+            continue
+
+        if value is None or value == "":
+            continue
+
+        if op not in allowed_ops:
+            op = "eq"
+
+        if field == "department" and value not in DEPARTMENTS:
+            continue
+
+        if field == "team" and value not in TEAMS:
+            continue
+
+        if field == "position" and value not in POSITIONS:
+            continue
+
+        safe_filters.append(
+            {
+                "field": field,
+                "op": op,
+                "value": value,
+            }
+        )
+
+    return safe_filters
+
+
+def add_filter_if_missing(
+    filters: list[dict],
+    field: str,
+    value,
+    op: str = "eq",
+) -> list[dict]:
+    """
+    department/team/position 값이 task에는 있는데 filters에 없으면 추가한다.
+    """
+
+    if not value:
+        return filters
+
+    for item in filters:
+        if item.get("field") == field and item.get("value") == value:
+            return filters
+
+    filters.append(
+        {
+            "field": field,
+            "op": op,
+            "value": value,
+        }
+    )
+
+    return filters
+
+
+def build_task_question(original_question: str, task: dict) -> str:
+    """
+    hybrid 검색에 사용할 질문을 만든다.
+
+    기존 기능은 유지하되, 원문 질문과 filters 값을 함께 넣는다.
+
+    예:
+    - 원문: 채용팀의 계약직 알려줘
+    - task_question: 채용팀의 계약직 알려줘 채용팀 계약직 직원
+    """
+
+    parts = [original_question]
+
+    for key in ["employee_name", "employee_id", "department", "team", "position"]:
+        value = task.get(key)
+
+        if value and str(value) not in " ".join(parts):
+            parts.append(str(value))
+
+    filters = task.get("filters", [])
+
+    if isinstance(filters, list):
+        for item in filters:
+            if not isinstance(item, dict):
+                continue
+
+            value = item.get("value")
+
+            if value and str(value) not in " ".join(parts):
+                parts.append(str(value))
+
+    for field in task.get("target_fields", []):
+        label = FIELD_RULES.get(field, {}).get("label")
+
+        if label and label not in " ".join(parts):
+            parts.append(label)
+
+    return " ".join(parts)
+
+
+def format_allowed_hits_answer(hits: list[dict], allowed_fields: list[str]) -> str:
+    source_items = make_sources(hits, allowed_fields=allowed_fields)
+
+    if not source_items:
+        return "조회 가능한 정보가 없습니다."
+
+    lines = []
+
+    for item in source_items:
+        values = []
+
+        if "employee" in allowed_fields:
+            employee_name = item.get("employee_name")
+            employee_id = item.get("employee_id")
+            employee_label = " / ".join(
+                value
+                for value in [employee_name, employee_id]
+                if value
+            )
+
+            if employee_label:
+                values.append(employee_label)
+
+        for field in allowed_fields:
+            if field == "employee":
+                continue
+
+            if item.get(field):
+                label = FIELD_RULES.get(field, {}).get("label", field)
+                values.append(f"{label}: {item[field]}")
+
+        if values:
+            lines.append("- " + " / ".join(values))
+
+    return "\n".join(lines) if lines else "조회 가능한 정보가 없습니다."
+
+
+def get_filter_fields(filters: list[dict]) -> list[str]:
+    """
+    filters에서 사용된 field 목록을 꺼낸다.
+    """
+
+    if not isinstance(filters, list):
+        return []
+
+    fields = []
+
+    for item in filters:
+        if not isinstance(item, dict):
+            continue
+
+        field = item.get("field")
+
+        if field in FIELD_RULES:
+            fields.append(field)
+
+    return unique_keep_order(fields)
+
+
+def to_number(value):
+    """
+    숫자 비교용 변환 함수.
+
+    예:
+    - "80점" -> 80
+    - "45,000,000원" -> 45000000
+    """
+
+    if value is None:
+        return None
+
+    text = str(value).replace(",", "")
+    match = re.search(r"-?\d+(\.\d+)?", text)
+
+    if not match:
+        return None
+
+    number_text = match.group()
+
+    if "." in number_text:
+        return float(number_text)
+
+    return int(number_text)
+
+
+def filter_match(actual_value, op: str, expected_value) -> bool:
+    """
+    filter 조건 하나를 비교한다.
+    """
+
+    if actual_value is None or actual_value == "":
+        return False
+
+    actual_text = str(actual_value).strip()
+    expected_text = str(expected_value).strip()
+
+    if op == "eq":
+        return actual_text == expected_text
+
+    if op == "contains":
+        return expected_text in actual_text
+
+    if op in {"gt", "gte", "lt", "lte"}:
+        actual_number = to_number(actual_value)
+        expected_number = to_number(expected_value)
+
+        if actual_number is None or expected_number is None:
+            return False
+
+        if op == "gt":
+            return actual_number > expected_number
+
+        if op == "gte":
+            return actual_number >= expected_number
+
+        if op == "lt":
+            return actual_number < expected_number
+
+        if op == "lte":
+            return actual_number <= expected_number
+
+    if op == "between":
+        if not isinstance(expected_value, list) or len(expected_value) != 2:
+            return False
+
+        actual_number = to_number(actual_value)
+        start_number = to_number(expected_value[0])
+        end_number = to_number(expected_value[1])
+
+        if actual_number is None or start_number is None or end_number is None:
+            return False
+
+        return start_number <= actual_number <= end_number
+
+    return False
+
+
+def filter_hits_by_filters(hits: list[dict], filters: list[dict]) -> list[dict]:
+    """
+    hybrid 검색 결과를 filters 조건으로 후처리한다.
+
+    중요:
+    - 직접조회가 아니다.
+    - search_hybrid() 이후 결과를 employee_id 기준으로 묶어서 조건을 확인한다.
+    - 같은 직원의 정보가 여러 chunk에 나뉘어 있어도 함께 판단한다.
+    """
+
+    if not filters:
+        return hits
+
+    grouped_hits = {}
+
+    for hit in hits:
+        source = hit.get("_source", {})
+        employee_id = source.get("employee_id")
+
+        if not employee_id:
+            continue
+
+        grouped_hits.setdefault(employee_id, []).append(hit)
+
+    matched_employee_ids = set()
+
+    for employee_id, employee_hits in grouped_hits.items():
+        matched_all_filters = True
+
+        for filter_item in filters:
+            field = filter_item.get("field")
+            op = filter_item.get("op", "eq")
+            expected_value = filter_item.get("value")
+
+            if field not in FIELD_RULES:
+                continue
+
+            matched_this_filter = False
+
+            for hit in employee_hits:
+                source = hit.get("_source", {})
+                embedding_text = source.get("embedding_text", "")
+
+                actual_value = get_allowed_field_value(
+                    source=source,
+                    embedding_text=embedding_text,
+                    field_key=field,
+                )
+
+                if filter_match(
+                    actual_value=actual_value,
+                    op=op,
+                    expected_value=expected_value,
+                ):
+                    matched_this_filter = True
+                    break
+
+            if not matched_this_filter:
+                matched_all_filters = False
+                break
+
+        if matched_all_filters:
+            matched_employee_ids.add(employee_id)
+
+    return [
+        hit
+        for hit in hits
+        if hit.get("_source", {}).get("employee_id") in matched_employee_ids
+    ]
+
+
+def has_non_org_filters(filters: list[dict]) -> bool:
+    """
+    department/team/position 외의 조건이 있는지 확인한다.
+
+    예:
+    - team=채용팀만 있으면 False
+    - team=채용팀 + contract_type=계약직이면 True
+    """
+
+    org_fields = {"department", "team", "position"}
+
+    for item in filters:
+        if item.get("field") not in org_fields:
+            return True
+
+    return False
+
+
+def process_task(
+    task: dict,
+    original_question: str,
+    requester_employee_id: str,
+    permission_level: int,
+) -> dict:
+    intent = task.get("intent", "unknown")
+
+    # department/team/position 값 검증
+    task = normalize_task_org_values(task)
+
+    # filters 정리
+    filters = sanitize_filters(task.get("filters", []))
+
+    if task.get("department"):
+        filters = add_filter_if_missing(
+            filters=filters,
+            field="department",
+            op="eq",
+            value=task.get("department"),
+        )
+
+    if task.get("team"):
+        filters = add_filter_if_missing(
+            filters=filters,
+            field="team",
+            op="eq",
+            value=task.get("team"),
+        )
+
+    if task.get("position") and not task.get("employee_name"):
+        filters = add_filter_if_missing(
+            filters=filters,
+            field="position",
+            op="eq",
+            value=task.get("position"),
+        )
+
+    task["filters"] = filters
+
+    # LLM이 뽑은 target_fields 중 FIELD_RULES에 등록된 것만 사용한다.
+    target_fields = [
+        field
+        for field in task.get("target_fields", [])
+        if field in FIELD_RULES
+    ]
+
+    filter_fields = get_filter_fields(filters)
+
+    if intent == "unknown" or not target_fields:
+        return {
+            "answer": "",
+            "sources": [],
+            "permission": {
+                "allowed": False,
+                "ignored": True,
+                "reason": "분석 가능한 유효 필드가 없습니다.",
+                "permission_level": permission_level,
+                "required_level": 1,
+                "allowed_fields": [],
+                "denied_fields": [],
+                "is_self": bool(task.get("is_self", False)),
+            },
+        }
+
+    is_self = bool(task.get("is_self", False))
+
+    # LLM이 직원 이름을 못 뽑은 경우를 대비한 보정
+    # 예: "오민호 사원번호 알려줘" → employee_name이 null로 오는 경우
+    if intent == "single_lookup" and not is_self:
+        if not task.get("employee_name") and not task.get("employee_id"):
+            guessed_name = extract_employee_name(original_question)
+
+            if guessed_name:
+                task["employee_name"] = guessed_name
+
+    # target_fields + filters에 쓰인 필드까지 포함해서 required_level 계산
+    search_related_fields = unique_keep_order(target_fields + filter_fields)
+
+    required_level = (
+        get_max_required_level(search_related_fields)
+        if search_related_fields
+        else 1
+    )
+
+    # 답변 필드 권한 판단
+    answer_fields, denied_answer_fields = split_fields_by_permission(
+        target_fields=target_fields,
+        permission_level=permission_level,
+        is_self=is_self,
+    )
+
+    # 조건 필드 권한 판단
+    allowed_filter_fields, denied_filter_fields = split_fields_by_permission(
+        target_fields=filter_fields,
+        permission_level=permission_level,
+        is_self=is_self,
+    )
+
+    denied_fields = unique_keep_order(denied_answer_fields + denied_filter_fields)
+    denied_message = build_denied_message(denied_fields)
+
+    # 조건 필드 권한이 없으면 검색 자체를 하지 않는다.
+    if denied_filter_fields:
+        return {
+            "answer": denied_message,
+            "sources": [],
+            "permission": {
+                "allowed": False,
+                "permission_level": permission_level,
+                "required_level": required_level,
+                "allowed_fields": answer_fields,
+                "denied_fields": denied_fields,
+                "is_self": is_self,
+            },
+        }
+
+    # 사용자가 요청한 답변 필드 중 허용된 것이 하나도 없으면 검색하지 않는다.
+    if not answer_fields:
+        return {
+            "answer": denied_message or "조회 가능한 필드가 없습니다.",
+            "sources": [],
+            "permission": {
+                "allowed": False,
+                "permission_level": permission_level,
+                "required_level": required_level,
+                "allowed_fields": [],
+                "denied_fields": denied_fields,
+                "is_self": is_self,
+            },
+        }
+
+    # allowed_fields = 최종 답변 표시용 필드
+    # context_fields = 조건 검증/LLM context/sources에 넣을 필드
+    allowed_fields = list(answer_fields)
+    context_fields = unique_keep_order(answer_fields + allowed_filter_fields)
+
+    if intent in {"single_lookup", "employee_list", "condition_search"}:
+        if "employee" not in allowed_fields:
+            allowed_fields.insert(0, "employee")
+
+        if "employee" not in context_fields:
+            context_fields.insert(0, "employee")
+
+    # 기본 검색 권한은 요청자의 실제 권한
+    search_permission_level = permission_level
+
+    # 본인 질문이면 본인 정보 조회를 허용하기 위해 필요한 레벨까지 검색 범위를 올린다.
+    # 단, 아래 search_employee_id에서 반드시 requester_employee_id로 필터를 건다.
+    if is_self:
+        search_permission_level = max(permission_level, required_level)
+
+    accessible_indices = ACCESSIBLE_INDICES.get(search_permission_level, [])
+
+    # 중요:
+    # 인덱스 선택은 answer_fields + allowed_filter_fields 기준으로 한다.
+    # 예: target_fields=["employee"], filters=[contract_type]이면 contract_type 인덱스도 포함해야 한다.
+    search_fields = unique_keep_order(answer_fields + allowed_filter_fields)
+
+    indices = select_indices_by_fields(
+        accessible_indices=accessible_indices,
+        allowed_fields=search_fields,
+    )
+
+    search_employee_id = None
+
+    # 본인 질문이면 무조건 요청자 employee_id로 검색한다.
+    if is_self:
+        search_employee_id = requester_employee_id
+
+    # 타인 질문에서 employee_id가 직접 들어온 경우
+    elif task.get("employee_id"):
+        search_employee_id = str(task["employee_id"]).strip().upper()
+
+    # 기존 정규식 추출 보조
+    else:
+        search_employee_id = extract_employee_id(original_question)
+
+    task_question = build_task_question(original_question, task)
+
+    # =========================
+    # 1. 카테고리 목록 질문
+    # 예: 부서 종류 알려줘, 팀 목록 알려줘
+    # → hybrid 검색보다 직접 집계가 정확하다.
+    # =========================
+    if intent == "category_list":
+        answers = [
+            build_category_answer(field, search_permission_level)
+            for field in answer_fields
+            if field in {"department", "team", "job_grade", "position"}
+        ]
+
+        answer = (
+            "\n\n".join(answers)
+            if answers
+            else "카테고리 필드를 찾을 수 없습니다."
+        )
+
+        if denied_message:
+            answer = f"{answer}\n\n{denied_message}"
+
+        return {
+            "answer": answer,
+            "sources": [],
+            "permission": {
+                "allowed": True,
+                "permission_level": permission_level,
+                "required_level": required_level,
+                "allowed_fields": answer_fields,
+                "denied_fields": denied_fields,
+                "is_self": is_self,
+            },
+        }
+
+    search_hits = []
+
+    # =========================
+    # 2. 직원 목록 질문
+    # 예: 개발부 직원 모두 알려줘
+    # → 부서/팀/직책만 있는 단순 직원 목록은 기존 직접 조회 유지
+    # → 단, 계약형태/성과점수/연봉 등 추가 조건이 있으면 hybrid로 보낸다.
+    # =========================
+    if (
+        intent == "employee_list"
+        and (task.get("department") or task.get("team") or task.get("position"))
+        and set(answer_fields) == {"employee"}
+        and not has_non_org_filters(filters)
+    ):
+        search_hits = search_employees_by_conditions(
+            permission_level=search_permission_level,
+            department=task.get("department"),
+            team=task.get("team"),
+            position=task.get("position"),
+            size=50,
+        )
+
+        answer = format_allowed_hits_answer(
+            hits=search_hits,
+            allowed_fields=allowed_fields,
+        )
+
+    # =========================
+    # 3. 단일 조회 / 조건 검색
+    # 예:
+    # - 김민수 부서 알려줘
+    # - 내 연봉 알려줘
+    # - 채용팀의 계약직 알려줘
+    # - 성과점수 80점 이상 직원 알려줘
+    # → 기존 hybrid 검색 사용
+    # =========================
+    else:
+        search_hits = search_hybrid(
+            question=task_question,
+            permission_level=search_permission_level,
+            employee_id=search_employee_id,
+            size=50,
+            indices=indices,
+        )
+
+        search_hits = filter_hits_by_filters(
+            hits=search_hits,
+            filters=filters,
+        )
+
+        search_hits = filter_hits_with_answer_values(
+            hits=search_hits,
+            answer_fields=answer_fields,
+        )
+
+        if not search_hits:
+            answer = "조회 가능한 정보가 없습니다."
+
+        # 조건 검색/직원 목록형 결과는 LLM에게 긴 목록 생성을 맡기지 않고 직접 포맷한다.
+        elif intent in {"condition_search", "employee_list"} and filters:
+            answer = format_allowed_hits_answer(
+                hits=search_hits,
+                allowed_fields=allowed_fields,
+            )
+
+        # 부서/팀 조건 + 특정 필드 조회도 직접 포맷한다.
+        # 예: "마케팅부 직원들 연봉 알려줘"
+        elif intent == "condition_search" and (task.get("department") or task.get("team")):
+            answer = format_allowed_hits_answer(
+                hits=search_hits,
+                allowed_fields=allowed_fields,
+            )
+
+        else:
+            context = build_context(
+                search_hits,
+                task_question,
+                allowed_fields=context_fields,
+            )
+
+            answer = generate_answer(
+                question=task_question,
+                context=context,
+            )
+
+    if denied_message:
+        answer = f"{answer}\n\n{denied_message}"
+
+    return {
+        "answer": answer,
+        "sources": make_sources(
+            search_hits,
+            allowed_fields=context_fields,
+        ),
+        "permission": {
+            "allowed": True,
+            "permission_level": permission_level,
+            "required_level": required_level,
+            "allowed_fields": answer_fields,
+            "denied_fields": denied_fields,
+            "is_self": is_self,
+        },
+    }
+
 
 @app.post("/rag-chat")
 def rag_chat(request: RagChatRequest):
-    """
-    권한 기반 RAG 챗봇 API이다.
-
-    처리 흐름:
-    1. 질문과 employee_id 입력값을 검증한다.
-    2. employee_id 기준으로 사용자 권한 레벨을 자동 계산한다.
-    3. 질문 내용 기준으로 필요한 정보 레벨을 판단한다.
-    4. 사용자 권한이 부족하면 차단한다.
-    5. 본인 질문이면 employee_id로 검색 대상을 제한한다.
-    6. OpenSearch에서 BM25 + 벡터 검색을 수행한다.
-    7. RRF 방식으로 병합된 검색 결과를 Context로 만든다.
-    8. Context와 질문을 gemma3:4b에 전달한다.
-    9. 답변과 출처 데이터를 반환한다.
-    """
-
-    # =========================
-    # 1. 질문 미입력 예외 처리
-    # =========================
-
     if not request.question or not request.question.strip():
         raise HTTPException(
             status_code=400,
             detail="질문을 입력해주세요.",
         )
 
-
-    # =========================
-    # 2. 사번 미입력 예외 처리
-    # =========================
-
     if not request.employee_id or not request.employee_id.strip():
         raise HTTPException(
             status_code=400,
             detail="employee_id를 입력해주세요.",
         )
-    # employee_id는 대소문자와 공백 차이를 없애기 위해 대문자로 통일한다.
+
     employee_id = request.employee_id.strip().upper()
-
-    # =========================
-    # 3. employee_id 기준 권한 레벨 계산
-    # =========================
-    # get_user_permission_level() 내부에서
-    # department_level과 job_grade_level 중 더 높은 값을 permission_level로 사용한다.
-
     permission_level = get_user_permission_level(employee_id)
 
-    # 사번으로 사용자를 찾지 못한 경우
     if permission_level is None:
         raise HTTPException(
             status_code=404,
-            detail="사용자 사번을 찾을 수 없습니다.",
+            detail="요청자 사번을 찾을 수 없습니다.",
         )
 
-    # 계산된 권한 레벨이 1, 2, 3 중 하나인지 확인
     if permission_level not in [1, 2, 3]:
         raise HTTPException(
             status_code=400,
-            detail="계산된 permission_level이 올바르지 않습니다.",
+            detail="계산된 permission_level이 유효하지 않습니다.",
         )
 
-    # =========================
-    # 4. 질문 내용 기준 필요 권한 레벨 판단(보조검증)
-    # =========================
-    # 예:
-    # - 기본 정보: 1
-    # - 연봉, 성과, 평가: 2
-    # - 주소, 계좌번호, 징계: 3
+    analysis = analyze_question_to_tasks(request.question)
+    tasks = normalize_tasks(analysis, request.question)
 
-    required_level = get_required_level(request.question)
+    task_results = [
+        process_task(
+            task=task,
+            original_question=request.question,
+            requester_employee_id=employee_id,
+            permission_level=permission_level,
+        )
+        for task in tasks
+    ]
 
-    # =========================
-    # 5. 본인 질문 여부 판단
-    # =========================
-
-    is_self = is_self_question(request.question)
-
-    # =========================
-    # 6. 권한 부족 시 차단
-    # =========================
-
-    if not is_self and permission_level < required_level:
-        return {
-            "success": False,
-            "answer": "해당 정보에 접근할 권한이 없습니다.",
-            "permission": {
-                "allowed": False,
-                "employee_id": employee_id,
-                "permission_level": permission_level,
-                "required_level": required_level,
-            },
-            "sources": [],
-            "model_type": "gemma3:4b",
-        }
-
-    # =========================
-    # 7. 검색 대상 employee_id 결정
-    # =========================
-
-    search_employee_id = None
-
-    if is_self:
-        search_employee_id = employee_id
-    else:
-        search_employee_id = extract_employee_id(request.question)
-
-    # =========================
-    # 8. 검색에 사용할 권한 레벨 결정
-    # =========================
-    # 기본적으로는 요청자의 permission_level을 사용한다.
-    # 단, 본인 조회인 경우에는 본인 데이터 조회를 허용하기 위해
-    # 질문에서 필요한 required_level까지 검색 범위를 넓힌다.
-    #
-    # 예:
-    # permission_level = 1
-    # required_level = 2
-    # 질문 = "내 연봉 알려줘"
-    # → 본인 조회이므로 search_permission_level = 2
-
-    search_permission_level = permission_level
-
-    if is_self:
-        search_permission_level = max(permission_level, required_level)
-
-    list_answer = build_full_list_answer(
-        question=request.question,
-        permission_level=search_permission_level,
-    )
-
-    if list_answer:
-        return {
-            "success": True,
-            "answer": list_answer,
-            "permission": {
-                "allowed": True,
-                "employee_id": employee_id,
-                "permission_level": permission_level,
-                "required_level": required_level,
-            },
-            "sources": [],
-            "model_type": "list-aggregation",
-        }
-
-    # =========================
-    # 10. 일반 RAG 검색 실행
-    # =========================
-
-    is_list_question = any(word in request.question for word in ["종류", "목록", "리스트"])
-
-    search_size = 300 if is_list_question else 20
-
-    search_hits = search_hybrid(
-        question=request.question,
-        permission_level=search_permission_level,
-        employee_id=search_employee_id,
-        size=search_size,
-    )
-    if not search_hits:
-        return {
-            "success": False,
-            "answer": "조회 가능한 정보가 없습니다.",
-            "permission": {
-                "allowed": True,
-                "employee_id": employee_id,
-                "permission_level": permission_level,
-                "required_level": required_level,
-            },
-            "sources": [],
-            "model_type": "gemma3:4b",
-        }
-
-    # =========================
-    # 11. 검색 결과를 LLM Context로 변환
-    # =========================
-
-    context = build_context(search_hits, request.question)
-
-    # =========================
-    # 12. gemma3:4b 답변 생성
-    # =========================
-
-    answer = generate_answer(
-        question=request.question,
-        context=context,
-    )
-
-    # =========================
-    # 13. 응답에 포함할 출처 데이터 구성
-    # =========================
+    answers = [
+        result["answer"]
+        for result in task_results
+        if result.get("answer")
+    ]
 
     sources = []
-
-    for hit in search_hits:
-        source = hit.get("_source", {})
-        embedding_text = source.get("embedding_text", "")
-
-        team = extract_embedding_text_field(embedding_text, "팀")
-        position = extract_embedding_text_field(embedding_text, "직책")
-        email = extract_embedding_text_field(embedding_text, "이메일")
-        phone = extract_embedding_text_field(embedding_text, "전화번호")
-        address = extract_embedding_text_field(embedding_text, "주소")
-        salary = extract_embedding_text_field(embedding_text, "연봉")
-        account = extract_embedding_text_field(embedding_text, "계좌번호")
-
-        sources.append(
-            {
-                "index": hit["_index"],
-                "_id": hit["_id"],
-                "employee_id": source.get("employee_id"),
-                "employee_name": source.get("employee_name"),
-                "department": source.get("department"),
-                "job_grade": source.get("job_grade"),
-
-                # embedding_text에서 추출한 상세값
-                "team": team,
-                "position": position,
-                "email": email,
-                "phone": phone,
-                "address": address,
-                "salary": salary,
-                "account": account,
-
-                # 원문 확인용
-                "embedding_text": embedding_text,
-
-                "score": hit.get("_score"),
-            }
-        )
-
-    # =========================
-    # 14. 최종 응답 반환
-    # =========================
+    for result in task_results:
+        sources.extend(result.get("sources", []))
 
     return {
-        "success": True,
-        "answer": answer,
+        "success": any(
+            result.get("permission", {}).get("allowed")
+            for result in task_results
+        ),
+        "answer": "\n\n".join(answers),
         "permission": {
-            "allowed": True,
             "employee_id": employee_id,
             "permission_level": permission_level,
-            "required_level": required_level,
+            "tasks": [
+                result.get("permission", {})
+                for result in task_results
+            ],
         },
+        "tasks": tasks,
         "sources": sources,
         "model_type": "gemma3:4b",
     }
-
-
-# =========================
-# 질문 내용 기준 필요 권한 레벨 판단
-# =========================
-
-def get_required_level(question: str) -> int:
-    """
-    질문에 포함된 키워드를 기준으로 필요한 권한 레벨을 판단한다.
-
-    1레벨: 일반 기본 정보
-    2레벨: 성과/평가 정보
-    3레벨: 주소/연락처/계좌/급여/연봉 등 민감 정보
-    """
-
-    level_3_keywords = [
-        "주소",
-        "거주지",
-        "사는 곳",
-        "사는곳",
-        "어디 살아",
-        "어디살아",
-        "자택",
-        "주민번호",
-        "주민등록번호",
-        "전화번호",
-        "연락처",
-        "휴대폰",
-        "핸드폰",
-        "계좌번호",
-        "계좌",
-        "은행",
-        "연봉",
-        "급여",
-        "월급",
-        "받는 돈",
-        "받는돈",
-        "보상",
-        "보수",
-        "수당",
-        "징계",
-        "퇴직",
-    ]
-
-    level_2_keywords = [
-        "성과",
-        "평가",
-        "고과",
-        "점수",
-        "TOEIC",
-        "토익",
-        "자격증",
-        "포상",
-        "수상",
-    ]
-
-    level_1_keywords = [
-        "이름",
-        "마케팅부",
-        "기획부",
-        "인사부",
-        "개발부",
-        "영업부",
-        "재무부",
-        "마케팅팀",
-        "기획팀",
-        "인사팀",
-        "개발팀",
-        "영업팀",
-        "재무팀",
-        "부서",
-        "팀",
-        "직급",
-        "직책",
-        "사원",
-        "대리",
-        "과장",
-        "차장",
-        "부장",
-        "팀원",
-        "팀장",
-        "입사일",
-        "이메일",
-        "인원",
-        "집계",
-    ]
-
-    for keyword in level_3_keywords:
-        if keyword in question:
-            return 3
-
-    if "집" in question and not any(word in question for word in ["집계", "집중", "모집"]):
-        return 3
-
-    for keyword in level_2_keywords:
-        if keyword in question:
-            return 2
-
-    for keyword in level_1_keywords:
-        if keyword in question:
-            return 1
-
-    return 1
