@@ -109,6 +109,197 @@ def find_known_value(question: str, values: list[str]) -> str | None:
     return None
 
 
+ORG_ALIAS_RULES = [
+    {
+        "keywords": ["영업", "영업관련", "영업쪽", "영업담당"],
+        "field": "department",
+        "value": "영업부",
+    },
+    {
+        "keywords": ["개발", "개발관련", "개발쪽", "개발담당"],
+        "field": "department",
+        "value": "개발부",
+    },
+    {
+        "keywords": ["인사", "인사관련", "인사쪽", "인사담당"],
+        "field": "department",
+        "value": "인사부",
+    },
+    {
+        "keywords": ["기획", "기획관련", "기획쪽", "기획담당"],
+        "field": "department",
+        "value": "기획부",
+    },
+    {
+        "keywords": ["마케팅", "마케팅관련", "마케팅쪽", "마케팅담당"],
+        "field": "department",
+        "value": "마케팅부",
+    },
+    {
+        "keywords": ["채용", "채용관련", "채용쪽", "채용담당"],
+        "field": "team",
+        "value": "채용팀",
+    },
+]
+
+
+def find_org_alias(question: str) -> tuple[str, str] | None:
+    """
+    질문의 조직 별칭을 실제 부서/팀 값으로 보정한다.
+
+    예:
+    - "영업 관련 직원" -> ("department", "영업부")
+    - "채용 계약직" -> ("team", "채용팀")
+
+    조건 if문을 늘리는 용도가 아니라, 조직 기준값 사전 보정만 담당한다.
+    """
+
+    compact_question = compact_text(question)
+
+    for rule in ORG_ALIAS_RULES:
+        if any(keyword in compact_question for keyword in rule["keywords"]):
+            return rule["field"], rule["value"]
+
+    return None
+
+
+def is_org_alias_text(text: str | None) -> bool:
+    """
+    employee_name 자리에 들어오면 안 되는 조직/별칭 표현인지 확인한다.
+    """
+
+    if not text:
+        return False
+
+    compact_value = compact_text(str(text))
+
+    if compact_value in DEPARTMENTS or compact_value in TEAMS or compact_value in POSITIONS:
+        return True
+
+    if compact_value.endswith("관련"):
+        return True
+
+    for rule in ORG_ALIAS_RULES:
+        if compact_value in rule["keywords"]:
+            return True
+
+    return False
+
+
+EVALUATION_GRADE_WORDS = {
+    "우수": "A",
+    "탁월": "A",
+    "최상": "A",
+    "좋음": "A",
+    "양호": "B",
+    "보통": "C",
+    "미흡": "D",
+    "부진": "D",
+}
+
+
+def get_evaluation_field_from_question(question: str) -> str:
+    """
+    평가 연도가 질문에 있으면 해당 연도 필드를, 없으면 최신 평가 필드를 사용한다.
+    """
+
+    for year in ["2020", "2021", "2022", "2023", "2024"]:
+        if year in question:
+            return f"evaluation_{year}"
+
+    return "evaluation_2024"
+
+
+def normalize_semantic_filters(filters: list[dict], question: str) -> list[dict]:
+    """
+    LLM이 자주 헷갈리는 의미 필터를 보정한다.
+
+    예:
+    - "평가가 우수한"은 최신 인사고과_2024 eq "A"다.
+    - "2023년 평가가 우수한"은 evaluation_2023 eq "A"다.
+    - "성과점수 80점 이상"처럼 숫자와 점수가 명시된 경우는 기존 숫자 조건을 유지한다.
+    """
+
+    if not filters:
+        return filters
+
+    compact_question = compact_text(question)
+    evaluation_grade = None
+
+    for word, grade in EVALUATION_GRADE_WORDS.items():
+        if word in compact_question:
+            evaluation_grade = grade
+            break
+
+    if not evaluation_grade:
+        return filters
+
+    normalized_filters = []
+    has_evaluation_filter = False
+    evaluation_field = get_evaluation_field_from_question(compact_question)
+    evaluation_fields = {
+        "evaluation",
+        "evaluation_2020",
+        "evaluation_2021",
+        "evaluation_2022",
+        "evaluation_2023",
+        "evaluation_2024",
+    }
+
+    for item in filters:
+        if not isinstance(item, dict):
+            continue
+
+        field = item.get("field")
+
+        if field in evaluation_fields:
+            has_evaluation_filter = True
+            normalized_filters.append(
+                {
+                    "field": field if field != "evaluation" else evaluation_field,
+                    "op": "eq",
+                    "value": evaluation_grade,
+                }
+            )
+            continue
+
+        normalized_filters.append(item)
+
+    if not has_evaluation_filter and ("평가" in compact_question or "고과" in compact_question):
+        normalized_filters.append(
+            {
+                "field": evaluation_field,
+                "op": "eq",
+                "value": evaluation_grade,
+            }
+        )
+
+    return normalized_filters
+
+
+def normalize_target_fields_by_question(
+    target_fields: list[str],
+    question: str,
+) -> list[str]:
+    """
+    LLM이 비슷한 식별자 필드를 헷갈린 경우 질문 원문 기준으로 보정한다.
+
+    예:
+    - "주민번호 알려줘"를 employee_id로 잘못 분석하면 rrn으로 바꾼다.
+    - "사번 알려줘"는 employee_id 그대로 둔다.
+    """
+
+    compact_question = compact_text(question)
+
+    if "주민등록번호" in compact_question or "주민번호" in compact_question:
+        return [
+            "rrn" if field == "employee_id" else field
+            for field in target_fields
+        ]
+
+    return target_fields
+
+
 def normalize_filters(raw_filters) -> list[dict]:
     """
     LLM이 반환한 filters를 안전한 형태로 정리한다.
@@ -300,12 +491,22 @@ filters:
 - 포함 조건은 op를 contains로 설정하세요.
 - 이상 조건은 gte, 초과 조건은 gt를 사용하세요.
 - 이하 조건은 lte, 미만 조건은 lt를 사용하세요.
+- "성과점수 80점 이상"처럼 숫자 점수를 말한 경우에만 performance_score와 gte/lte/gt/lt를 사용하세요.
+- "평가가 우수한", "고과가 우수한"처럼 평가 등급을 말한 경우에는 최신 평가인 evaluation_2024를 사용하세요.
+- 평가 등급 표현은 실제 데이터 등급으로 바꾸세요. 우수/탁월/좋음은 A, 양호는 B, 보통은 C, 미흡/부진은 D입니다.
+- "2023년 평가가 우수한"처럼 연도가 있으면 evaluation_2023 eq "A"처럼 해당 연도 필드를 사용하세요.
+- 숫자가 없는 "우수한 평가"를 임의로 80점 이상으로 바꾸지 마세요.
 - 본인 정보를 묻는 경우 is_self를 true로 설정하세요.
 - 직원 이름이 있으면 employee_name에 넣으세요.
 - EMP0001 같은 실제 사번이 있으면 employee_id에 넣으세요.
+- 사원번호/사번을 물으면 target_fields는 employee_id입니다.
+- 주민등록번호/주민번호를 물으면 target_fields는 rrn입니다.
+- 주민등록번호/주민번호를 employee_id로 분석하지 마세요.
 - 실제 부서 목록 중 하나가 포함되면 department에도 넣고 filters에도 넣으세요.
 - 실제 팀 목록 중 하나가 포함되면 team에도 넣고 filters에도 넣으세요.
 - 실제 직책 목록 중 하나가 조건으로 포함되면 position에도 넣고 filters에도 넣으세요.
+- "영업 관련", "영업쪽", "영업 담당"처럼 조직 별칭 표현은 영업부 조건으로 분석하세요.
+- "채용 관련", "채용쪽", "채용 담당"처럼 팀 별칭 표현은 채용팀 조건으로 분석하세요.
 - "팀"과 "팀장/팀원"은 다릅니다. "팀장", "팀원"은 team이 아니라 position입니다.
 - 사용자가 여러 개의 독립된 질문을 하면 task를 여러 개로 나누세요.
 
@@ -323,6 +524,7 @@ filters:
 
 3. 조건 검색
 - "계약직", "정규직", "성과점수 80점 이상", "TOEIC 900점 이상"처럼 조건이 있으면 filters에 넣으세요.
+- "평가가 우수한", "고과가 우수한"처럼 평가 등급 조건이 있으면 evaluation_2024 eq "A"를 filters에 넣으세요.
 - 조건에 맞는 직원을 묻는 질문이면 target_fields는 ["employee"]입니다.
 - 조건에 맞는 직원의 이메일/연봉/주소 등을 묻는 질문이면 target_fields는 해당 필드입니다.
 
@@ -370,7 +572,7 @@ filters:
 - 계좌번호 -> account
 - 4대보험가입여부 -> insurance
 - 성과점수 -> performance_score
-- 평가, 인사평가, 고과, 인사고과 -> evaluation
+- 평가, 인사평가, 고과, 인사고과 -> evaluation_2024
 - 2020년 평가 -> evaluation_2020
 - 2021년 평가 -> evaluation_2021
 - 2022년 평가 -> evaluation_2022
@@ -507,6 +709,36 @@ filters:
 }}
 
 [예시 6]
+질문: "평가가 우수한 계약직 알려줘"
+답변:
+{{
+  "tasks": [
+    {{
+      "intent": "condition_search",
+      "target_fields": ["employee"],
+      "employee_name": null,
+      "employee_id": null,
+      "department": null,
+      "team": null,
+      "position": null,
+      "filters": [
+        {{
+          "field": "evaluation_2024",
+          "op": "eq",
+          "value": "A"
+        }},
+        {{
+          "field": "contract_type",
+          "op": "eq",
+          "value": "계약직"
+        }}
+      ],
+      "is_self": false
+    }}
+  ]
+}}
+
+[예시 7]
 질문: "부서 종류 알려줘"
 답변:
 {{
@@ -525,7 +757,7 @@ filters:
   ]
 }}
 
-[예시 7]
+[예시 8]
 질문: "인사부 알려줘"
 답변:
 {{
@@ -550,31 +782,68 @@ filters:
   ]
 }}
 
+[예시 9]
+질문: "영업 관련 직원 찾아줘"
+답변:
+{{
+  "tasks": [
+    {{
+      "intent": "employee_list",
+      "target_fields": ["employee"],
+      "employee_name": null,
+      "employee_id": null,
+      "department": "영업부",
+      "team": null,
+      "position": null,
+      "filters": [
+        {{
+          "field": "department",
+          "op": "eq",
+          "value": "영업부"
+        }}
+      ],
+      "is_self": false
+    }}
+  ]
+}}
+
 사용자 질문:
 {question}
 """
 
-    response = requests.post(
-        OLLAMA_URL,
-        json={
-            "model": MODEL_NAME,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": 0,
-            },
-        },
-        timeout=30,
-    )
-
-    response.raise_for_status()
-
-    raw_text = response.json().get("response", "").strip()
-    json_text = clean_json_text(raw_text)
-
     try:
-        return json.loads(json_text)
-    except json.JSONDecodeError:
+        response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": MODEL_NAME,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0,
+                    "num_predict": 700,
+                },
+            },
+            timeout=180,
+        )
+
+        response.raise_for_status()
+
+        raw_text = response.json().get("response", "").strip()
+        json_text = clean_json_text(raw_text)
+
+        try:
+            return json.loads(json_text)
+        except json.JSONDecodeError:
+            print("[ERROR] question analyzer JSON decode failed")
+            print("[DEBUG] raw_text:", raw_text)
+            return {"tasks": [DEFAULT_TASK.copy()]}
+
+    except requests.exceptions.Timeout:
+        print("[ERROR] question analyzer timeout")
+        return {"tasks": [DEFAULT_TASK.copy()]}
+
+    except requests.exceptions.RequestException as e:
+        print("[ERROR] question analyzer request failed:", e)
         return {"tasks": [DEFAULT_TASK.copy()]}
 
 
@@ -595,6 +864,16 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
     found_department = find_known_value(question, DEPARTMENTS)
     found_team = find_known_value(question, TEAMS)
     found_position = find_known_value(question, POSITIONS)
+    found_org_alias = find_org_alias(question)
+
+    if found_org_alias and not found_department and not found_team:
+        alias_field, alias_value = found_org_alias
+
+        if alias_field == "department":
+            found_department = alias_value
+
+        if alias_field == "team":
+            found_team = alias_value
 
     compact_question = compact_text(question)
 
@@ -644,6 +923,11 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
         if not safe_fields:
             safe_fields = ["unknown"]
 
+        safe_fields = normalize_target_fields_by_question(
+            target_fields=safe_fields,
+            question=question,
+        )
+
         raw_department = task.get("department")
         raw_team = task.get("team")
         raw_position = task.get("position")
@@ -653,6 +937,7 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
         position = raw_position if raw_position in POSITIONS else found_position
 
         filters = normalize_filters(task.get("filters", []))
+        filters = normalize_semantic_filters(filters, question)
 
         if department:
             filters = add_filter_if_missing(
@@ -696,11 +981,16 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
         if filters and safe_fields == ["unknown"]:
             safe_fields = ["employee"]
 
+        employee_name = task.get("employee_name")
+
+        if is_org_alias_text(employee_name):
+            employee_name = None
+
         normalized_tasks.append(
             {
                 "intent": intent,
                 "target_fields": safe_fields,
-                "employee_name": task.get("employee_name"),
+                "employee_name": employee_name,
                 "employee_id": task.get("employee_id"),
                 "department": department,
                 "team": team,

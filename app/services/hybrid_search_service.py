@@ -1,5 +1,6 @@
 import os
 import re
+import time
 from dotenv import load_dotenv
 from opensearchpy import OpenSearch
 from transformers import AutoTokenizer, AutoModel
@@ -661,7 +662,15 @@ def select_search_indices(question: str, permission_level: int) -> list[str]:
 # BM25 검색 함수
 # =========================
 
-def search_bm25(question, permission_level, employee_id=None, size=5, indices=None):
+def search_bm25(
+    question,
+    permission_level,
+    employee_id=None,
+    employee_name=None,
+    extract_name=True,
+    size=5,
+    indices=None,
+):
     """
     embedding_text 필드를 대상으로 BM25 기반 키워드 검색을 수행한다.
 
@@ -755,8 +764,14 @@ def search_bm25(question, permission_level, employee_id=None, size=5, indices=No
                 )
                 break
 
-        # 직원 이름이 들어온 경우 employee_name 또는 embedding_text에서 검색
-        target_name = extract_employee_name(question)
+        # 직원 이름이 들어온 경우 employee_name 또는 embedding_text에서 검색한다.
+        # task 분석에서 employee_name을 명시적으로 넘긴 경우 그 값만 사용한다.
+        # condition_search 질문에서는 "계약직", "영업관련" 같은 단어가 이름으로
+        # 오인될 수 있으므로 main.py에서 extract_name=False로 호출한다.
+        target_name = employee_name
+
+        if not target_name and extract_name:
+            target_name = extract_employee_name(question)
 
         # 이름처럼 보이지만 실제로는 이름이 아닌 단어들
         not_person_names = [
@@ -822,6 +837,8 @@ def search_vector(
     question_vector,
     permission_level,
     employee_id=None,
+    employee_name=None,
+    extract_name=True,
     size=5,
     indices=None,
 ):
@@ -911,7 +928,10 @@ def search_vector(
     hits = response["hits"]["hits"]
 
     # employee_id가 없을 때만 이름 기반 필터를 사용한다.
-    target_name = extract_employee_name(question)
+    target_name = employee_name
+
+    if not target_name and extract_name:
+        target_name = extract_employee_name(question)
 
     if target_name:
         hits = [
@@ -1253,7 +1273,7 @@ def format_employee_list_answer(hits) -> str:
     """
 
     if not hits:
-        return "조회 가능한 정보가 없습니다."
+        return "조건에 맞는 조회 결과가 없습니다."
 
     lines = []
 
@@ -1380,6 +1400,8 @@ def search_hybrid(
     question,
     permission_level,
     employee_id=None,
+    employee_name=None,
+    extract_name=True,
     size=20,
     indices=None,
 ):
@@ -1388,40 +1410,67 @@ def search_hybrid(
     RRF 방식으로 결과를 병합한다.
     """
 
+    start_time = time.perf_counter()
+
     if employee_id:
         employee_id = employee_id.strip().upper()
 
+    vector_create_start_time = time.perf_counter()
     question_vector = create_question_vector(question)
+    print(
+        "[TIME] create_question_vector:",
+        f"{time.perf_counter() - vector_create_start_time:.3f}s",
+    )
 
     # 바깥에서 indices를 넘기면 그 인덱스만 검색한다.
     # 안 넘기면 기존 방식대로 질문과 권한 기준으로 인덱스를 선택한다.
     indices = indices or select_search_indices(question, permission_level)
 
+    bm25_start_time = time.perf_counter()
     bm25_hits = search_bm25(
         question=question,
         permission_level=permission_level,
         employee_id=employee_id,
+        employee_name=employee_name,
+        extract_name=extract_name,
         size=size,
         indices=indices,
     )
+    print(
+        "[TIME] search_bm25:",
+        f"{time.perf_counter() - bm25_start_time:.3f}s",
+    )
 
+    vector_start_time = time.perf_counter()
     vector_hits = search_vector(
         question=question,
         question_vector=question_vector,
         permission_level=permission_level,
         employee_id=employee_id,
+        employee_name=employee_name,
+        extract_name=extract_name,
         size=size,
         indices=indices,
+    )
+    print(
+        "[TIME] search_vector:",
+        f"{time.perf_counter() - vector_start_time:.3f}s",
     )
 
     print("[DEBUG] Vector hits count:", len(vector_hits))
 
+    rrf_start_time = time.perf_counter()
     hybrid_hits = merge_rrf(
         bm25_hits=bm25_hits,
         vector_hits=vector_hits,
         size=size,
     )
+    print(
+        "[TIME] merge_rrf:",
+        f"{time.perf_counter() - rrf_start_time:.3f}s",
+    )
 
     print("[DEBUG] Hybrid RRF hits count:", len(hybrid_hits))
+    print("[TIME] search_hybrid total:", f"{time.perf_counter() - start_time:.3f}s")
 
     return hybrid_hits

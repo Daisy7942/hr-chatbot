@@ -1,5 +1,6 @@
 import re
 import requests
+import time
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -38,6 +39,11 @@ from app.services.org_policy_service import (
 
 
 app = FastAPI(title="Durian HR RAG Chatbot")
+
+
+COMMON_ERROR_MESSAGE = "요청하신 정보를 확인할 수 없습니다."
+PERMISSION_DENIED_MESSAGE = "해당 정보에 접근할 권한이 없습니다."
+NO_SEARCH_RESULT_MESSAGE = "조건에 맞는 조회 결과가 없습니다."
 
 
 class ChatRequest(BaseModel):
@@ -288,11 +294,31 @@ def format_allowed_hits_answer(hits: list[dict], allowed_fields: list[str]) -> s
     source_items = make_sources(hits, allowed_fields=allowed_fields)
 
     if not source_items:
-        return "조회 가능한 정보가 없습니다."
+        return NO_SEARCH_RESULT_MESSAGE
+
+    grouped_items = {}
+    fallback_items = []
+
+    for item in source_items:
+        employee_id = item.get("employee_id")
+        group_key = employee_id
+
+        if not group_key:
+            fallback_items.append(item)
+            continue
+
+        if group_key not in grouped_items:
+            grouped_items[group_key] = {}
+
+        grouped_item = grouped_items[group_key]
+
+        for key, value in item.items():
+            if value and key not in grouped_item:
+                grouped_item[key] = value
 
     lines = []
 
-    for item in source_items:
+    for item in list(grouped_items.values()) + fallback_items:
         values = []
 
         if "employee" in allowed_fields:
@@ -318,7 +344,7 @@ def format_allowed_hits_answer(hits: list[dict], allowed_fields: list[str]) -> s
         if values:
             lines.append("- " + " / ".join(values))
 
-    return "\n".join(lines) if lines else "조회 가능한 정보가 없습니다."
+    return "\n".join(lines) if lines else NO_SEARCH_RESULT_MESSAGE
 
 
 def get_filter_fields(filters: list[dict]) -> list[str]:
@@ -516,7 +542,9 @@ def process_task(
     requester_employee_id: str,
     permission_level: int,
 ) -> dict:
+    task_start_time = time.perf_counter()
     intent = task.get("intent", "unknown")
+    print("[TIME] process_task start:", intent)
 
     # department/team/position 값 검증
     task = normalize_task_org_values(task)
@@ -560,8 +588,12 @@ def process_task(
     filter_fields = get_filter_fields(filters)
 
     if intent == "unknown" or not target_fields:
+        print(
+            "[TIME] process_task ignored:",
+            f"{time.perf_counter() - task_start_time:.3f}s",
+        )
         return {
-            "answer": "",
+            "answer": COMMON_ERROR_MESSAGE,
             "sources": [],
             "permission": {
                 "allowed": False,
@@ -614,8 +646,12 @@ def process_task(
 
     # 조건 필드 권한이 없으면 검색 자체를 하지 않는다.
     if denied_filter_fields:
+        print(
+            "[TIME] process_task denied_filter:",
+            f"{time.perf_counter() - task_start_time:.3f}s",
+        )
         return {
-            "answer": denied_message,
+            "answer": PERMISSION_DENIED_MESSAGE,
             "sources": [],
             "permission": {
                 "allowed": False,
@@ -629,8 +665,12 @@ def process_task(
 
     # 사용자가 요청한 답변 필드 중 허용된 것이 하나도 없으면 검색하지 않는다.
     if not answer_fields:
+        print(
+            "[TIME] process_task denied_answer:",
+            f"{time.perf_counter() - task_start_time:.3f}s",
+        )
         return {
-            "answer": denied_message or "조회 가능한 필드가 없습니다.",
+            "answer": PERMISSION_DENIED_MESSAGE,
             "sources": [],
             "permission": {
                 "allowed": False,
@@ -696,6 +736,7 @@ def process_task(
     # → hybrid 검색보다 직접 집계가 정확하다.
     # =========================
     if intent == "category_list":
+        category_start_time = time.perf_counter()
         answers = [
             build_category_answer(field, search_permission_level)
             for field in answer_fields
@@ -710,6 +751,15 @@ def process_task(
 
         if denied_message:
             answer = f"{answer}\n\n{denied_message}"
+
+        print(
+            "[TIME] category_list:",
+            f"{time.perf_counter() - category_start_time:.3f}s",
+        )
+        print(
+            "[TIME] process_task total:",
+            f"{time.perf_counter() - task_start_time:.3f}s",
+        )
 
         return {
             "answer": answer,
@@ -738,6 +788,7 @@ def process_task(
         and set(answer_fields) == {"employee"}
         and not has_non_org_filters(filters)
     ):
+        direct_search_start_time = time.perf_counter()
         search_hits = search_employees_by_conditions(
             permission_level=search_permission_level,
             department=task.get("department"),
@@ -750,6 +801,10 @@ def process_task(
             hits=search_hits,
             allowed_fields=allowed_fields,
         )
+        print(
+            "[TIME] direct_employee_search:",
+            f"{time.perf_counter() - direct_search_start_time:.3f}s",
+        )
 
     # =========================
     # 3. 단일 조회 / 조건 검색
@@ -761,14 +816,22 @@ def process_task(
     # → 기존 hybrid 검색 사용
     # =========================
     else:
+        hybrid_start_time = time.perf_counter()
         search_hits = search_hybrid(
             question=task_question,
             permission_level=search_permission_level,
             employee_id=search_employee_id,
+            employee_name=task.get("employee_name"),
+            extract_name=False,
             size=50,
             indices=indices,
         )
+        print(
+            "[TIME] search_hybrid call:",
+            f"{time.perf_counter() - hybrid_start_time:.3f}s",
+        )
 
+        filter_start_time = time.perf_counter()
         search_hits = filter_hits_by_filters(
             hits=search_hits,
             filters=filters,
@@ -778,9 +841,15 @@ def process_task(
             hits=search_hits,
             answer_fields=answer_fields,
         )
+        print(
+            "[TIME] filter_hits:",
+            f"{time.perf_counter() - filter_start_time:.3f}s",
+            "hits:",
+            len(search_hits),
+        )
 
         if not search_hits:
-            answer = "조회 가능한 정보가 없습니다."
+            answer = NO_SEARCH_RESULT_MESSAGE
 
         # 조건 검색/직원 목록형 결과는 LLM에게 긴 목록 생성을 맡기지 않고 직접 포맷한다.
         elif intent in {"condition_search", "employee_list"} and filters:
@@ -798,10 +867,15 @@ def process_task(
             )
 
         else:
+            context_start_time = time.perf_counter()
             context = build_context(
                 search_hits,
                 task_question,
                 allowed_fields=context_fields,
+            )
+            print(
+                "[TIME] build_context:",
+                f"{time.perf_counter() - context_start_time:.3f}s",
             )
 
             answer = generate_answer(
@@ -812,12 +886,23 @@ def process_task(
     if denied_message:
         answer = f"{answer}\n\n{denied_message}"
 
+    sources_start_time = time.perf_counter()
+    sources = make_sources(
+        search_hits,
+        allowed_fields=context_fields,
+    )
+    print(
+        "[TIME] make_sources:",
+        f"{time.perf_counter() - sources_start_time:.3f}s",
+    )
+    print(
+        "[TIME] process_task total:",
+        f"{time.perf_counter() - task_start_time:.3f}s",
+    )
+
     return {
         "answer": answer,
-        "sources": make_sources(
-            search_hits,
-            allowed_fields=context_fields,
-        ),
+        "sources": sources,
         "permission": {
             "allowed": True,
             "permission_level": permission_level,
@@ -831,6 +916,7 @@ def process_task(
 
 @app.post("/rag-chat")
 def rag_chat(request: RagChatRequest):
+    request_start_time = time.perf_counter()
     if not request.question or not request.question.strip():
         raise HTTPException(
             status_code=400,
@@ -844,7 +930,12 @@ def rag_chat(request: RagChatRequest):
         )
 
     employee_id = request.employee_id.strip().upper()
+    permission_start_time = time.perf_counter()
     permission_level = get_user_permission_level(employee_id)
+    print(
+        "[TIME] get_user_permission_level:",
+        f"{time.perf_counter() - permission_start_time:.3f}s",
+    )
 
     if permission_level is None:
         raise HTTPException(
@@ -858,9 +949,23 @@ def rag_chat(request: RagChatRequest):
             detail="계산된 permission_level이 유효하지 않습니다.",
         )
 
+    analyze_start_time = time.perf_counter()
     analysis = analyze_question_to_tasks(request.question)
-    tasks = normalize_tasks(analysis, request.question)
+    print(
+        "[TIME] analyze_question_to_tasks:",
+        f"{time.perf_counter() - analyze_start_time:.3f}s",
+    )
 
+    normalize_start_time = time.perf_counter()
+    tasks = normalize_tasks(analysis, request.question)
+    print(
+        "[TIME] normalize_tasks:",
+        f"{time.perf_counter() - normalize_start_time:.3f}s",
+        "tasks:",
+        len(tasks),
+    )
+
+    tasks_start_time = time.perf_counter()
     task_results = [
         process_task(
             task=task,
@@ -870,6 +975,10 @@ def rag_chat(request: RagChatRequest):
         )
         for task in tasks
     ]
+    print(
+        "[TIME] all process_task:",
+        f"{time.perf_counter() - tasks_start_time:.3f}s",
+    )
 
     answers = [
         result["answer"]
@@ -880,6 +989,11 @@ def rag_chat(request: RagChatRequest):
     sources = []
     for result in task_results:
         sources.extend(result.get("sources", []))
+
+    print(
+        "[TIME] rag_chat total:",
+        f"{time.perf_counter() - request_start_time:.3f}s",
+    )
 
     return {
         "success": any(

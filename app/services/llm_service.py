@@ -1,4 +1,5 @@
 import requests
+import time
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL_NAME = "gemma3:4b"
@@ -18,7 +19,7 @@ def build_rag_prompt(question: str, context: str) -> str:
         반드시 [검색 결과]에 포함된 내용만 근거로 답변합니다.
         검색 결과에 없는 내용은 추측하거나 생성하지 않습니다.
         검색 결과만으로 답변이 불가능하면 반드시 다음 문장으로 답변합니다.
-        "조회된 데이터에서 확인할 수 없습니다."
+        "조건에 맞는 조회 결과가 없습니다."
 
         [검색 결과 해석 규칙]
 
@@ -35,7 +36,7 @@ def build_rag_prompt(question: str, context: str) -> str:
         → 팀이 브랜드팀이고, 이메일에 naver가 포함된 직원만 답변합니다.
 
         4. 조건을 만족하는 직원이 검색 결과 안에서 확인되지 않으면 다음과 같이 답변합니다.
-        "조회된 데이터에서 확인할 수 없습니다."
+        "조건에 맞는 조회 결과가 없습니다."
 
         5. 사용자가 질문한 항목만 답변합니다.
         질문하지 않은 항목은 검색 결과에 있어도 답변하지 않습니다.
@@ -136,8 +137,11 @@ def generate_answer(question: str, context: str) -> str:
     Context 기반 답변을 생성한다.
     """
 
+    start_time = time.perf_counter()
     prompt = build_rag_prompt(question, context)
+    print("[TIME] build_rag_prompt:", f"{time.perf_counter() - start_time:.3f}s")
 
+    request_start_time = time.perf_counter()
     response = requests.post(
         OLLAMA_URL,
         json={
@@ -150,9 +154,15 @@ def generate_answer(question: str, context: str) -> str:
         },
         timeout=60,
     )
+    print(
+        "[TIME] generate_answer ollama:",
+        f"{time.perf_counter() - request_start_time:.3f}s",
+    )
 
     response.raise_for_status()
 
     result = response.json()
+
+    print("[TIME] generate_answer total:", f"{time.perf_counter() - start_time:.3f}s")
 
     return result.get("response", "").strip()
