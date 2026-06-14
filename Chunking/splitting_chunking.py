@@ -43,10 +43,7 @@ def count_tokens(text):
 
 # ── 1. 데이터 로딩 ─────────────────────────────────────────────────────────────
 
-jsonl_files = sorted(
-    f for f in INPUT_DIR.glob('*.jsonl')
-    if f.name != 'changes_history.jsonl'
-)
+jsonl_files = sorted(INPUT_DIR.glob('*.jsonl'))
 
 if not jsonl_files:
     print(f'JSONL 파일 없음: {INPUT_DIR}')
