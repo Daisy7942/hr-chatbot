@@ -103,20 +103,38 @@ print(f'\n정규화 완료! 적용된 레코드 수: {normalize_count:,}건')
 # ── 3. 동적 청킹 ──────────────────────────────────────────────────────────────
 
 def chunk_by_tokens(embedding_text, max_tokens):
-    # 필드를 하나씩 추가하면서 토큰 한계를 체크
+    # 필드를 하나씩 누적하며 토큰 한계로 청크를 나눈다.
+    #
+    # [성능] 각 필드의 토큰 수를 미리 한 번씩만 계산해두고 누적 합으로 한계를 판단한다.
+    #        예전에는 필드를 더할 때마다 누적된 전체 텍스트를 처음부터 다시 토큰화해서
+    #        필드 수의 제곱에 가깝게 토큰화가 일어났는데, 이 방식은 필드당 한 번만 한다.
     fields = [f for f in embedding_text.split('\n') if f.strip()]
+
+    # 각 필드를 special token 없이 토큰화한 길이를 미리 계산
+    field_lengths = [len(tokenizer.encode(f, add_special_tokens=False)) for f in fields]
+    # 필드 사이를 잇는 줄바꿈(\n)의 토큰 수
+    newline_length = len(tokenizer.encode('\n', add_special_tokens=False))
+    # 청크 전체에 한 번 붙는 special token([CLS], [SEP]) 수
+    special_length = tokenizer.num_special_tokens_to_add()
+
     chunks = []
     current_fields = []
+    current_length = 0  # 현재 청크에 쌓인 토큰 수 (줄바꿈 포함, special 제외)
 
-    for field in fields:
-        # 현재 필드를 추가했을 때 토큰 수 계산
-        candidate_text = '\n'.join(current_fields + [field])
-        if count_tokens(candidate_text) > max_tokens and current_fields:
-            # 한계 초과 → 이전 필드까지로 청크 마감하고 새 청크 시작
+    for field, field_length in zip(fields, field_lengths):
+        # 이 필드를 더하면 늘어나는 토큰 수 (앞에 필드가 있으면 줄바꿈도 더함)
+        added = field_length
+        if current_fields:
+            added += newline_length
+
+        # special token까지 더한 총 토큰이 한계를 넘으면 직전까지로 청크를 마감
+        if special_length + current_length + added > max_tokens and current_fields:
             chunks.append('\n'.join(current_fields))
             current_fields = [field]
+            current_length = field_length
         else:
             current_fields.append(field)
+            current_length += added
 
     # 마지막 청크 추가
     if current_fields:
@@ -199,12 +217,22 @@ print('\n토큰 한계 초과 여부 확인 중...')
 print('-' * 50)
 
 for file_name, chunks in chunked_sets.items():
-    over_count = 0
+    # 한계를 넘은 청크를 모은다.
+    # 정상 청킹이면 0건이어야 한다. 0건이 아니라면 필드 하나가 MAX_TOKENS보다 길다는 뜻이고,
+    # 그런 청크는 임베딩할 때 모델이 뒷부분을 잘라내(truncate) 정보가 일부 손실될 수 있다.
+    over_chunks = []
     for chunk in chunks:
-        if count_tokens(chunk['embedding_text']) > MAX_TOKENS:
-            over_count += 1
-    status = '정상' if over_count == 0 else f'초과 {over_count}건'
-    print(f'  {file_name}: [{status}]')
+        token_count = count_tokens(chunk['embedding_text'])
+        if token_count > MAX_TOKENS:
+            over_chunks.append((chunk.get('employee_id', '?'), token_count))
+
+    if not over_chunks:
+        print(f'  {file_name}: [정상]')
+    else:
+        print(f'  {file_name}: [초과 {len(over_chunks)}건]')
+        # 어느 사원의 청크가 한계를 넘었는지 안내한다 (해당 사원 데이터를 점검할 수 있도록)
+        for emp_id, token_count in over_chunks:
+            print(f'    경고: 사원 {emp_id} 청크 {token_count}토큰 > 한계 {MAX_TOKENS} → 임베딩 시 잘릴 수 있음')
 
 print('-' * 50)
 
