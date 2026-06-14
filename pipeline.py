@@ -26,7 +26,7 @@ load_dotenv(BASE_DIR / '.env')
 
 # 입력 · 로그 경로
 DATASET_DIR    = BASE_DIR / 'data' / 'dataset'    # 원본 CSV 폴더
-ERROR_LOG_PATH = BASE_DIR / 'data' / 'error.log'  # 전처리 에러 로그 (데이터가 아니라 점검용 로그라 파일로 남김)
+ERROR_LOG_PATH = BASE_DIR / 'data' / 'error.log'  # 1~4단계 에러 로그 (점검용)
 
 # 사전 · 상태 파일 (config 폴더)
 CONFIG_DIR          = BASE_DIR / 'config'
@@ -1282,10 +1282,8 @@ def build_filtered_text(parsed, fields):
 
 
 def create_indices(client):
-    # 인덱스를 생성하고, 사용자 사전이 바뀐 경우 재생성 여부를 사용자에게 확인한다.
-    #
-    # 사전(user_dictionary.txt / synonym.txt)이 바뀌면 인덱스를 새 사전으로
-    # 다시 만들어야 검색에 반영된다. 변경 감지 시 기존 인덱스를 자동으로 삭제하고 재생성한다.
+    # 인덱스를 생성한다. 사전(user_dictionary.txt / synonym.txt)이 바뀌면 새 사전으로
+    # 다시 만들어야 검색에 반영되므로, 변경 감지 시 기존 인덱스를 자동으로 삭제하고 재생성한다.
     print('\n========== 인덱스 생성 ==========')
 
     current_hash = get_dict_hash()

@@ -1,141 +1,130 @@
 # 두리안정보기술 인사 데이터 RAG 챗봇 — 데이터 파이프라인
 
 인사 데이터를 전처리하고 OpenSearch에 적재하는 파이프라인입니다.
+원본 CSV를 읽어 정제 → 레코드 변환 → 청킹 → 임베딩 적재까지 한 번에 처리합니다.
 
 ---
 
 ## 파이프라인 구조
 
+4개 단계가 하나의 스크립트(`pipeline.py`)로 통합되어 있습니다.
+단계 사이의 데이터는 **중간 파일을 만들지 않고 메모리로 전달**합니다.
+
 ```
-Preprocessing/  →  JSONL/  →  Chunking/  →  embedding_indexer/
-  원본 CSV 정제     JSONL 변환    청킹 분할      임베딩 생성 + OpenSearch 적재
+1단계: 전처리      원본 CSV 검증·교정
+   ↓ (메모리)
+2단계: 레코드 변환  직원별 레코드(dict) 생성
+   ↓ (메모리)
+3단계: 청킹        embedding_text를 토큰 한계에 맞춰 분할
+   ↓ (메모리)
+4단계: 인덱싱      임베딩 생성 + OpenSearch 적재 (변경된 직원만 증분 적재)
 ```
+
+증분 적재 기준은 별도 상태 파일이 아니라 **OpenSearch에 적재된 값과 직접 비교**합니다.
+값이 바뀐 직원만 다시 임베딩하고, 바뀐 필드는 `changed` 배열에 이력으로 남깁니다.
 
 ---
 
-## 실행 순서
+## 프로젝트 구조
 
-### 사전 준비
+```
+pipeline.py            전체 파이프라인 (1~4단계)
+config/
+  user_dictionary.txt  nori 사용자 사전
+  synonym.txt          동의어 사전
+data/                  실행 시 원본 CSV를 두는 폴더 (CSV는 저장소에 포함되지 않음)
+requirements.txt       의존성
+```
 
-OpenSearch가 실행 중이어야 합니다.  
-각 폴더의 `.env` 파일에서 경로 및 설정값을 확인하세요.
+> `.env`, 원본 CSV(`data/dataset/`), 실행 중 생성되는 로그·상태 파일은
+> 저장소에 포함되지 않습니다(아래 *사전 준비* 참고).
 
 ---
 
-### 1단계 — 전처리 (`Preprocessing/`)
+## 사전 준비
 
-원본 CSV를 정제하여 `Preprocessing/output/`에 저장합니다.  
-에러 내역은 `Preprocessing/output/error.log`에 기록됩니다.
+1. **OpenSearch 실행** — `localhost:9200`에서 동작 중이어야 합니다.
+   nori 플러그인이 없으면 스크립트가 자동으로 안내합니다.
 
-```
-Preprocessing/dataset/*.csv  →  Preprocessing/output/*_정제.csv
-```
+2. **원본 CSV 준비** — `data/dataset/` 폴더에 아래 3개 파일을 둡니다.
 
-**실행**
+   | 파일 | 컬럼 수 | 레코드 수 |
+   |---|---|---|
+   | `기본인사정보.csv` | 30개 | 2,000건 |
+   | `역량성과.csv` | 13개 | 2,000건 |
+   | `급여정보.csv` | 7개 | 2,000건 |
+
+3. **`.env` 생성** — 저장소 루트에 `.env` 파일을 만들고 아래 값을 채웁니다.
+
+   ```
+   # 청킹 (청크당 최대 토큰 수, special token 2개 포함)
+   MAX_TOKENS=120
+
+   # OpenSearch 연결
+   OPENSEARCH_HOST=localhost
+   OPENSEARCH_PORT=9200
+   OPENSEARCH_USER=<사용자명>
+   OPENSEARCH_PASSWORD=<비밀번호>
+   OPENSEARCH_USE_SSL=true
+   OPENSEARCH_VERIFY_CERTS=false
+
+   # 임베딩 모델
+   EMBED_MODEL_NAME=paraphrase-multilingual-MiniLM-L12-v2
+   EMBED_DIMENSION=384
+   EMBED_BATCH_SIZE=64
+
+   # KNN 설정
+   KNN_ENGINE=lucene
+   KNN_METHOD=hnsw
+   KNN_SPACE_TYPE=cosinesimil
+   ```
+
+---
+
+## 실행
+
 ```bash
-cd Preprocessing
-python preprocessing.py
+pip install -r requirements.txt
+python pipeline.py
 ```
 
-**환경 설정** (`Preprocessing/.env`)
-```
-INPUT_DIR=dataset
-OUTPUT_DIR=output
-```
+- 1~4단계가 순서대로 실행됩니다.
+- 처음 실행하면 7개 인덱스를 생성하고 전체를 적재합니다.
+- 다시 실행하면 **값이 바뀐 직원만** 다시 적재하고, 나머지는 건너뜁니다.
+- 사용자 사전(`config/user_dictionary.txt` / `synonym.txt`)이 바뀌면
+  인덱스를 자동으로 재생성합니다.
 
 ---
 
-### 2단계 — JSONL 변환 (`JSONL/`)
+## 단계별 설명
 
-정제된 CSV를 JSONL 형식으로 변환합니다.  
-재실행 시 변경된 필드를 `changed` 배열에 기록합니다.
+### 1단계 — 전처리
+원본 CSV를 컬럼별로 검증·교정하고, 문제 있는 행은 제거합니다.
+결측치는 모두 `미입력`으로 통일합니다.
 
-```
-Preprocessing/output/*_정제.csv  →  JSONL/output/*_정제.jsonl
-```
+### 2단계 — 레코드 변환
+정제된 데이터를 직원별 레코드로 만들고, 검색용 `embedding_text`를 구성합니다.
+이름·부서·직급은 `hr_basic_1`에만 들어갑니다.
 
-**실행**
-```bash
-cd JSONL
-python jsonl_conversion.py
-```
+### 3단계 — 청킹
+`embedding_text`를 토큰 한계(`MAX_TOKENS`)에 맞춰 여러 청크로 나눕니다.
 
-**환경 설정** (`JSONL/.env`)
-```
-INPUT_DIR=../Preprocessing/output
-OUTPUT_DIR=output
-```
+### 4단계 — 인덱싱
+인덱스별 필드만 골라 임베딩 벡터를 생성하고 OpenSearch에 적재합니다.
+OpenSearch에 이미 있는 값과 비교해 **바뀐 직원만** 재적재하며,
+바뀐 필드는 `changed` 이력에 기록합니다.
 
----
-
-### 3단계 — 청킹 (`Chunking/`)
-
-JSONL의 `embedding_text`를 200자 단위로 분할합니다.
-
-```
-JSONL/output/*_정제.jsonl  →  Chunking/output/*_정제.jsonl
-```
-
-**실행**
-```bash
-cd Chunking
-python splitting_chunking.py
-```
-
-**환경 설정** (`Chunking/.env`)
-```
-INPUT_DIR=../JSONL/output
-OUTPUT_DIR=output
-CHUNK_SIZE=200
-CHUNK_OVERLAP=50
-```
+> 퇴사 직원도 인덱스에서 삭제하지 않습니다(인사 이력 보존). 접근 권한 회수는 적재가 아닌 별도 영역에서 처리합니다.
 
 ---
 
-### 4단계 — 임베딩 생성 및 OpenSearch 적재 (`embedding_indexer/`)
+## 에러 로그
 
-청킹된 JSONL을 읽어 인덱스별로 `embedding_text`를 재구성하고  
-임베딩 벡터를 생성하여 OpenSearch 7개 인덱스에 적재합니다.
+1~4단계에서 발생한 문제는 `data/error.log` 한 파일에 단계별로 구분되어 기록됩니다.
 
-- nori 플러그인이 없으면 자동으로 다운로드 후 설치 안내를 출력합니다.
-- 이전 실행 시각(`last_indexed.txt`)을 기준으로 변경된 직원만 증분 적재합니다.
-
-```
-Chunking/output/*_정제.jsonl  →  OpenSearch (hr_basic_1~3, hr_performance_2~3, hr_salary_2~3)
-```
-
-**실행**
-```bash
-cd embedding_indexer
-python embedding_indexer.py
-```
-
-**환경 설정** (`embedding_indexer/.env`)
-```
-# 입출력 경로
-INPUT_DIR=../Chunking/output
-
-# OpenSearch 연결 설정
-OPENSEARCH_HOST=localhost
-OPENSEARCH_PORT=9200
-OPENSEARCH_USER=durian
-OPENSEARCH_PASSWORD=Admin1234!
-OPENSEARCH_USE_SSL=true
-OPENSEARCH_VERIFY_CERTS=false
-
-# OpenSearch 홈 경로 (nori 플러그인 자동 설치에 사용)
-OPENSEARCH_HOME=../opensearch-3.3.2
-
-# 임베딩 모델
-EMBED_MODEL_NAME=paraphrase-multilingual-MiniLM-L12-v2
-EMBED_DIMENSION=384
-EMBED_BATCH_SIZE=64
-
-# KNN 설정
-KNN_ENGINE=lucene
-KNN_METHOD=hnsw
-KNN_SPACE_TYPE=cosinesimil
-```
+- **1단계**: 전처리 검증 에러 (어떤 값이 왜 교정·제거됐는지)
+- **3단계**: 빈 텍스트 스킵 / 토큰 한계 초과 경고
+- **4단계**: OpenSearch 적재 실패
 
 ---
 
@@ -151,18 +140,9 @@ KNN_SPACE_TYPE=cosinesimil
 | `hr_salary_2` | 2 | 잔업시간, 미사용휴가일수 |
 | `hr_salary_3` | 3 | 연봉, 계좌번호, 4대보험 등 |
 
-**접근 권한**: `permission_level = MAX(부서레벨, 직급레벨)`  
+**접근 권한**: `permission_level = MAX(부서레벨, 직급레벨)`
 본인 데이터는 레벨 무관 전체 접근 가능.
-
----
-
-## 데이터 파일 구성
-
-| 파일 | 컬럼 수 | 레코드 수 |
-|---|---|---|
-| `기본인사정보.csv` | 30개 | 2,000건 |
-| `역량성과.csv` | 13개 | 2,000건 |
-| `급여정보.csv` | 7개 | 2,000건 |
+(권한 계산은 파이프라인이 아니라 검색·접근제어 영역에서 수행합니다.)
 
 ---
 
