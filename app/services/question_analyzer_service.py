@@ -38,13 +38,13 @@ DEFAULT_TASK = {
 
 
 ALLOWED_FILTER_OPS = {
-    "eq",
-    "contains",
-    "gt",
-    "gte",
-    "lt",
-    "lte",
-    "between",
+    "eq", # 정확히 일치
+    "contains", # 포함
+    "gt", # 초과
+    "gte", # 이상
+    "lt", # 미만
+    "lte", # 이하
+    "between", # 범위 (예: 2020년 평가 between A and C)
 }
 
 
@@ -52,8 +52,13 @@ def build_field_schema_text() -> str:
     """
     FIELD_RULES 기준으로 LLM에게 보여줄 HR 필드 목록을 만든다.
 
-    이제 question_analyzer_service.py에 필드 목록을 직접 길게 쓰지 않는다.
-    app/services/query_policy_service.py의 FIELD_RULES만 관리하면 된다.
+    예)  
+    - employee: 직원
+    - department: 부서
+    - salary: 연봉
+    - unknown: 알 수 없는 필드 로 바꿉니다.     
+
+    FIELD_RULES 로 관리하면 된다.
     """
 
     lines = []
@@ -73,8 +78,13 @@ def clean_json_text(text: str) -> str:
     """
 
     text = text.strip()
+    # LLM 응답이 ```json ... ``` 형태의 마크다운 코드블록으로 감싸져 올 수 있으므로 제거한다.
     text = re.sub(r"^```json", "", text)
+
+    # json 언어 표시 없이 ``` 로만 시작하는 코드블록도 제거한다.
     text = re.sub(r"^```", "", text)
+
+    # 응답 마지막에 붙은 코드블록 종료 표시 ``` 를 제거한다.
     text = re.sub(r"```$", "", text)
     text = text.strip()
 
@@ -348,16 +358,23 @@ def normalize_target_fields_by_question(
     - "주민번호 알려줘"를 employee_id로 잘못 분석하면 rrn으로 바꾼다.
     - "사번 알려줘"는 employee_id 그대로 둔다.
     """
-
+    #질문 원문에서 공백 제거한 버전을 만든다.
     compact_question = compact_text(question)
 
+    # 사용자가 입력한 주민등록번호(rrn)를 물어본 것을 LLM이 employee_id로 잘못 분석하는 경우 rrnㅇ로 보정한다.
     if "주민등록번호" in compact_question or "주민번호" in compact_question:
         return [
+            # field가 employee_id인 경우 rrn으로 바꾼다. 그 외 필드는 그대로 둔다.
             "rrn" if field == "employee_id" else field
+
+            # target_fields 안의 필드를 하나씩 확인한다.
             for field in target_fields
         ]
 
+    # 주민등록번호 관련 질문이 아니면
+    # 기존 target_fields를 그대로 반환한다.
     return target_fields
+
 
 
 def normalize_employee_identity_fields(task: dict) -> tuple[str | None, str | None]:
@@ -387,61 +404,153 @@ def normalize_employee_identity_fields(task: dict) -> tuple[str | None, str | No
 
 def normalize_filters(raw_filters) -> list[dict]:
     """
-    LLM이 반환한 filters를 안전한 형태로 정리한다.
+    LLM이 반환한 filters를 안전한 형태로 정리하는 함수.
 
-    허용 예:
+    filters는 검색 조건을 의미한다.
+
+    예:
+    "채용팀 직원 알려줘"
+    -> team이 채용팀인 직원만 찾기 위해 filter가 필요하다.
+
+    최종적으로 이 함수는 아래처럼 안전한 리스트 형태를 반환한다.
+
     [
         {"field": "team", "op": "eq", "value": "채용팀"},
         {"field": "contract_type", "op": "eq", "value": "계약직"}
     ]
 
-    예전 호환용으로 dict도 지원한다.
-    예:
-    {"team": "채용팀", "contract_type": "계약직"}
+    중요:
+    - LLM이 만든 filters를 그대로 믿지 않는다.
+    - 허용된 field인지 검사한다.
+    - 허용된 op인지 검사한다.
+    - value가 비어 있으면 제거한다.
+    - 부서/팀/직책 값이 실제 목록에 있는지도 검사한다.
     """
 
+    # 최종적으로 정리된 필터들을 담을 리스트
     normalized_filters = []
 
+    # =========================
+    # 1. dict 형태 filters 변환
+    # =========================
+
+    # 원래 filters는 list 형태가 표준이다.
+    #
+    # 표준 형태:
+    # [
+    #     {"field": "team", "op": "eq", "value": "채용팀"}
+    # ]
+    #
+    # 그런데 LLM이나 예전 코드가 아래처럼 dict 형태로 줄 수도 있다.
+    #
+    # {
+    #     "team": "채용팀",
+    #     "contract_type": "계약직"
+    # }
+    #
+    # 이 경우 뒤쪽 코드에서 처리하기 쉽도록 list 형태로 변환한다.
     if isinstance(raw_filters, dict):
         raw_filters = [
             {
+                # dict의 key를 field로 사용한다.
+                # 예: "team"
                 "field": field,
+
+                # dict 형태에는 op 정보가 없으므로 기본값 eq를 넣는다.
+                # eq는 "같다"라는 뜻이다.
+                # 예: team == "채용팀"
                 "op": "eq",
+
+                # dict의 value를 검색 기준 값으로 사용한다.
+                # 예: "채용팀"
                 "value": value,
             }
             for field, value in raw_filters.items()
         ]
 
+    # =========================
+    # 2. filters 타입 검사
+    # =========================
+
+    # dict 변환까지 했는데도 list가 아니면 잘못된 값이다.
+    # 이런 값은 처리할 수 없으므로 빈 리스트를 반환한다.
     if not isinstance(raw_filters, list):
         return []
 
+    # =========================
+    # 3. filter 하나씩 검사
+    # =========================
+
     for item in raw_filters:
+        # filter 하나는 반드시 dict여야 한다.
         if not isinstance(item, dict):
             continue
 
+        # 어떤 필드를 조건으로 볼지 꺼낸다.
+        # 예: "team", "department", "position"
         field = item.get("field")
+
+        # 어떤 방식으로 비교할지 꺼낸다.
+        # 없으면 기본값으로 eq를 사용한다.
+        #
+        # op 예:
+        # eq  -> 같다
+        # gt  -> 크다
+        # gte -> 크거나 같다
+        # lt  -> 작다
+        # lte -> 작거나 같다
         op = item.get("op", "eq")
+
+        # 비교할 기준 값을 꺼낸다.
+        # 예: "채용팀", "마케팅부", "대리"
         value = item.get("value")
 
+        # =========================
+        # 4. field 검증
+        # =========================
+
+        # field가 허용된 필드 중 하나인지 검사한다.
         if field not in FIELD_RULES:
             continue
 
+        # =========================
+        # 5. op 검증
+        # =========================
+
+        # op가 허용된 연산자가 아니면 기본값 eq로 바꾼다.
         if op not in ALLOWED_FILTER_OPS:
             op = "eq"
 
+        # =========================
+        # 6. value 검증
+        # =========================
+
+        # value가 없으면 검색 조건으로 사용할 수 없다.
+        # 뭐와 같아야 하는지 기준값이 없으면 제거한다.
         if value is None or value == "":
             continue
 
-         # 부서/팀/직책 값 검증
+        # =========================
+        # 7. 부서/팀/직책 값 검증
+        # =========================
+
+        # department 필터라면 value가 실제 부서 목록에 있어야 한다.
         if field == "department" and value not in DEPARTMENTS:
             continue
 
+        # team 필터라면 value가 실제 팀 목록에 있어야 한다.
         if field == "team" and value not in TEAMS:
             continue
 
+        # position 필터라면 value가 실제 직급/직책 목록에 있어야 한다.
         if field == "position" and value not in POSITIONS:
             continue
 
+        # =========================
+        # 8. 안전한 filter만 최종 리스트에 추가
+        # =========================
+
+        # 위 검사를 모두 통과한 filter만 normalized_filters에 넣는다.
         normalized_filters.append(
             {
                 "field": field,
@@ -450,6 +559,7 @@ def normalize_filters(raw_filters) -> list[dict]:
             }
         )
 
+    # 최종적으로 안전하게 정리된 filters 반환
     return normalized_filters
 
 
@@ -907,63 +1017,121 @@ filters:
                 "stream": False,
                 "options": {
                     "temperature": 0,
-                    "num_predict": 1200,
+                    "num_predict": 1200, 
+                    # 토큰 수가 많은 복잡한 질문도 분석할 수 있게 늘린다. 답변이 잘리는 경우 이 값을 더 늘려본다.
                 },
             },
             timeout=180,
         )
 
+        # http 요청 실패는 예외로 처리한다. 타임아웃, 연결 오류, 4xx/5xx 응답 등
         response.raise_for_status()
 
         raw_text = response.json().get("response", "").strip()
         json_text = clean_json_text(raw_text)
 
         try:
+            #json 형식을 python dict로 변환한다.
             return json.loads(json_text)
         except json.JSONDecodeError:
-            print("[ERROR] question analyzer JSON decode failed")
+            print("[ERROR] 질문 분석 결과 JSON 변환 실패")
             print("[DEBUG] raw_text:", raw_text)
             return build_fallback_analysis(question)
 
     except requests.exceptions.Timeout:
-        print("[ERROR] question analyzer timeout")
+        print("[ERROR] 질문 분석 LLM 요청 시간 초과")
         return {"tasks": [DEFAULT_TASK.copy()]}
 
     except requests.exceptions.RequestException as e:
-        print("[ERROR] question analyzer request failed:", e)
+        print("[ERROR] 질문 분석 LLM 요청 실패:", e)
         return {"tasks": [DEFAULT_TASK.copy()]}
 
 
 def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
     """
-    LLM 분석 결과를 코드에서 안전하게 보정한다.
+    LLM 분석 결과를 코드에서 안전하게 보정하는 함수.
+
+    LLM이 반환한 tasks를 그대로 사용하면 위험할 수 있다.
+    예를 들어 LLM이 없는 필드명을 만들거나,
+    잘못된 intent를 만들거나,
+    부서/팀/직급을 제대로 못 잡을 수 있다.
+
+    그래서 이 함수에서 하는 일은 다음과 같다.
+
+    1. analysis 안에서 tasks 목록을 꺼낸다.
+    2. 질문 문장에 실제로 들어있는 부서/팀/직급을 코드로 다시 찾는다.
+    3. intent가 허용된 값인지 확인한다.
+    4. target_fields가 허용된 필드인지 확인한다.
+    5. filters 형식을 안전하게 정리한다.
+    6. 부서/팀/직급 조건을 filters에 추가한다.
+    7. category_list / employee_list / condition_search 같은 intent를 보정한다.
+    8. 최종적으로 안전한 task 목록을 반환한다.
 
     중요:
-    - 권한 판단은 여기서 하지 않는다.
-    - 필드명과 filters 형식만 안전하게 정리한다.
+    - 여기서는 권한 판단을 하지 않는다.
+    - 권한 판단은 task_processor_service.py 또는 query_policy_service.py 쪽에서 한다.
+    - 이 함수는 질문 분석 결과를 "정리/보정"하는 역할만 한다.
     """
 
+    # LLM 분석 결과에서 tasks 배열을 꺼낸다.
+    # analysis 예시:
+    # {
+    #     "tasks": [
+    #         {
+    #             "intent": "employee_list",
+    #             "target_fields": ["employee"],
+    #             "department": "마케팅부"
+    #         }
+    #     ]
+    # }
     tasks = analysis.get("tasks", [])
 
-    if not isinstance(tasks, list) or not tasks:
+    # tasks가 리스트가 아니거나 비어 있으면
+    # 아래 for문에서 처리할 수 없으므로 빈 리스트로 초기화한다.
+    if (not isinstance(tasks, list)) or (not tasks):
         tasks = []
 
+    # =========================
+    # 1. 질문 문장에서 조직 정보 직접 탐색
+    # =========================
+
+    # LLM이 department/team/position을 못 잡을 수도 있기 때문에
+    # 코드에서 질문 문장에 실제 부서명이 있는지 다시 찾는다.
     found_department = find_known_value(question, DEPARTMENTS)
+
+    # 질문 문장에 실제 팀명이 있는지 찾는다.
     found_team = find_known_value(question, TEAMS)
+
+    # 질문 문장에 실제 직급/직책명이 있는지 찾는다.
     found_position = find_known_value(question, POSITIONS)
+
+    # 사용자가 정확한 부서명/팀명이 아니라 별칭처럼 물어볼 수 있다.
+    # 이런 표현을 실제 department 또는 team 값으로 바꿔줄 수 있는지 찾는다.
     found_org_alias = find_org_alias(question)
 
-    if found_org_alias and not found_department and not found_team:
+    # 별칭이 발견되었고,
+    # 아직 정확한 부서/팀을 못 찾은 경우에만 별칭 결과를 사용한다.
+    #
+    # 즉, 정확한 부서명이 이미 있으면 그 값을 우선한다.
+    if found_org_alias and (not found_department) and (not found_team):
         alias_field, alias_value = found_org_alias
 
+        # 별칭이 department로 해석되면 found_department에 넣는다.
         if alias_field == "department":
             found_department = alias_value
 
+        # 별칭이 team으로 해석되면 found_team에 넣는다.
         if alias_field == "team":
             found_team = alias_value
 
+    # =========================
+    # 2. 목록 질문인지 판단
+    # =========================
+
+    # 질문에서 공백 등을 제거해 비교하기 쉽게 만든다.
     compact_question = compact_text(question)
 
+    # 사용자가 "목록 자체"를 물어볼 때 쓰는 키워드들
     list_keywords = [
         "종류",
         "목록",
@@ -980,52 +1148,111 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
         "직책뭐",
     ]
 
+    # 질문 안에 목록형 키워드가 하나라도 있으면
+    # category_list 요청으로 볼 가능성이 있다.
     requested_category_list = any(
         keyword in compact_question
         for keyword in list_keywords
     )
 
+    # 최종적으로 정리된 task들을 담을 리스트
     normalized_tasks = []
 
+    # =========================
+    # 3. LLM이 만든 task 하나씩 검사
+    # =========================
+
     for task in tasks:
+        # task는 dict 형태여야 한다.
+        # dict가 아니면 잘못된 값이므로 건너뛴다.
         if not isinstance(task, dict):
             continue
 
+        # -------------------------
+        # 3-1. intent 안전성 검사
+        # -------------------------
+
+        # LLM이 추출한 intent를 가져온다.
+        # 없으면 unknown으로 둔다.
         intent = task.get("intent", "unknown")
 
+        # intent가 허용된 목록에 없으면 unknown으로 보정한다.
         if intent not in ALLOWED_INTENTS:
             intent = "unknown"
 
+        # -------------------------
+        # 3-2. target_fields 안전성 검사
+        # -------------------------
+
+        # LLM이 추출한 target_fields를 가져온다.
+        # 없으면 ["unknown"]으로 둔다.
         target_fields = task.get("target_fields", ["unknown"])
 
+        # target_fields는 반드시 리스트여야 한다.
+        # 문자열이나 다른 타입이면 안전하게 unknown으로 바꾼다.
         if not isinstance(target_fields, list):
             target_fields = ["unknown"]
 
+        # 허용된 필드만 남긴다.
         safe_fields = [
             field
             for field in target_fields
             if field in ALLOWED_FIELDS
         ]
 
+        # 허용된 필드가 하나도 없으면 unknown으로 둔다.
         if not safe_fields:
             safe_fields = ["unknown"]
 
+        # 질문 문장을 기준으로 target_fields를 한 번 더 보정한다.
         safe_fields = normalize_target_fields_by_question(
             target_fields=safe_fields,
             question=question,
         )
 
+        # -------------------------
+        # 3-3. 부서/팀/직급 값 보정
+        # -------------------------
+
+        # LLM이 추출한 부서/팀/직급 값을 가져온다.
         raw_department = task.get("department")
         raw_team = task.get("team")
         raw_position = task.get("position")
 
+        # LLM이 준 department가 실제 DEPARTMENTS 목록에 있으면 사용한다.
+        # 아니면 질문 문장에서 코드로 찾은 found_department를 사용한다.
         department = raw_department if raw_department in DEPARTMENTS else found_department
+
+        # LLM이 준 team이 실제 TEAMS 목록에 있으면 사용한다.
+        # 아니면 질문 문장에서 코드로 찾은 found_team을 사용한다.
         team = raw_team if raw_team in TEAMS else found_team
+
+        # LLM이 준 position이 실제 POSITIONS 목록에 있으면 사용한다.
+        # 아니면 질문 문장에서 코드로 찾은 found_position을 사용한다.
         position = raw_position if raw_position in POSITIONS else found_position
 
+        # -------------------------
+        # 3-4. filters 정규화
+        # -------------------------
+
+        # LLM이 만든 filters를 안전한 형식으로 정리한다.
+        #
+        # filters 예시:
+        # [
+        #     {"field": "department", "op": "eq", "value": "마케팅부"}
+        # ]
         filters = normalize_filters(task.get("filters", []))
+
+        # 질문 의미를 보고 filters를 한 번 더 보정한다.
+        #
+        # 예:
+        # "성과 좋은 직원" 같은 표현이 있으면
+        # performance 관련 조건으로 보정할 수 있다.
         filters = normalize_semantic_filters(filters, question)
 
+        # 질문에서 부서가 확인되었으면 filters에 department 조건을 추가한다.
+        #
+        # 이미 같은 조건이 있으면 중복 추가하지 않는다.
         if department:
             filters = add_filter_if_missing(
                 filters=filters,
@@ -1034,6 +1261,7 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
                 value=department,
             )
 
+        # 질문에서 팀이 확인되었으면 filters에 team 조건을 추가한다.
         if team:
             filters = add_filter_if_missing(
                 filters=filters,
@@ -1042,6 +1270,15 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
                 value=team,
             )
 
+        # 질문에서 직급/직책이 확인되었고,
+        # 특정 직원 이름을 묻는 질문이 아니면 position 조건을 추가한다.
+        #
+        # 예:
+        # "대리 직원 알려줘" -> position 필터 필요
+        #
+        # 반대로
+        # "김민수 대리의 부서 알려줘"처럼 employee_name이 있으면
+        # position을 조건으로 강하게 걸지 않는다.
         if position and not task.get("employee_name"):
             filters = add_filter_if_missing(
                 filters=filters,
@@ -1050,8 +1287,21 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
                 value=position,
             )
 
-        # "인사부 알려줘"처럼 실제 부서명이 있는데 목록 질문이 아니면
-        # category_list가 아니라 employee_list로 보정한다.
+        # =========================
+        # 4. intent 보정
+        # =========================
+
+        # "인사부 알려줘" 같은 질문은 주의해야 한다.
+        #
+        # LLM은 "인사부"라는 부서명을 보고
+        # category_list로 잘못 판단할 수 있다.
+        #
+        # 하지만 사용자가 "부서 목록"을 물어본 게 아니라
+        # 특정 부서의 직원을 알려달라는 의미일 수 있다.
+        #
+        # 그래서 실제 부서/팀/직급이 있고,
+        # "종류/목록/전체부서" 같은 목록형 키워드가 없으면
+        # category_list를 employee_list로 보정한다.
         if (
             intent == "category_list"
             and not requested_category_list
@@ -1060,19 +1310,49 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
             intent = "employee_list"
             safe_fields = ["employee"]
 
-        # filters가 있는데 unknown이면 조건 검색으로 보정한다.
+        # filters가 있는데 intent가 unknown이면
+        # 조건 검색으로 볼 수 있으므로 condition_search로 보정한다.
+        #
+        # 예:
+        # "마케팅부 대리 알려줘"
+        # -> department, position 필터가 있으므로 조건 검색
         if filters and intent == "unknown":
             intent = "condition_search"
 
-        # filters가 있는데 target_fields를 못 잡았으면 직원 목록 조회로 본다.
+        # filters는 있는데 target_fields를 못 잡은 경우
+        # 최소한 직원 목록을 찾는 질문으로 보고 employee 필드를 사용한다.
+        #
+        # 예:
+        # "마케팅부 알려줘"
+        # 필터: department=마케팅부
+        # target_fields: unknown
+        # -> employee 목록 조회로 보정
         if filters and safe_fields == ["unknown"]:
             safe_fields = ["employee"]
 
+        # -------------------------
+        # 5. 직원 식별 정보 정규화
+        # -------------------------
+
+        # employee_name, employee_id를 안전하게 정리한다.
+        #
+        # 예:
+        # "emp0070" -> "EMP0070"
+        # 이름이 없으면 None
         employee_name, employee_id = normalize_employee_identity_fields(task)
 
+        # LLM이 "인사부", "마케팅부" 같은 조직명을
+        # employee_name으로 잘못 넣는 경우가 있다.
+        #
+        # 그런 경우 직원 이름이 아니므로 None으로 제거한다.
         if is_org_alias_text(employee_name):
             employee_name = None
 
+        # -------------------------
+        # 6. 정규화된 task 추가
+        # -------------------------
+
+        # 위에서 안전하게 보정한 값들만 최종 task로 저장한다.
         normalized_tasks.append(
             {
                 "intent": intent,
@@ -1087,7 +1367,19 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
             }
         )
 
+    # =========================
+    # 7. task가 하나도 없을 때 기본 task 추가
+    # =========================
+
+    # LLM 응답이 비었거나,
+    # 모든 task가 잘못된 형식이라서 건너뛰어진 경우
+    # 빈 리스트를 반환하지 않고 DEFAULT_TASK를 넣어준다.
+    #
+    # 이렇게 해야 뒤쪽 process_task에서 최소한 unknown 질문으로 처리할 수 있다.
     if not normalized_tasks:
         normalized_tasks.append(DEFAULT_TASK.copy())
 
+    # 최종 정규화된 task 목록 반환
     return normalized_tasks
+
+

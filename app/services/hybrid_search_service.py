@@ -345,6 +345,7 @@ def build_full_list_answer(question: str, permission_level: int) -> str | None:
             },
         }
 
+    # 선택된 인덱스에서 query 조건에 맞는 검색 결과를 가져온다.
     response = client.search(index=indices, body=query)
 
     hits = response["hits"]["hits"]
@@ -537,8 +538,10 @@ def create_question_vector(question):
 
     # 검색용 임베딩 생성이므로 학습은 하지 않는다.
     # torch.no_grad()를 쓰면 메모리 사용이 줄어든다.
+    # 지금은 학습 아니고 예측/변환만 할 거니까 가볍게 실행해라
     with torch.no_grad():
         outputs = embedding_model(**inputs)
+        # **inputs는 딕셔너리를 함수 인자로 풀어주는 문법
 
     # 각 토큰별 임베딩 벡터
     token_embeddings = outputs.last_hidden_state
@@ -576,7 +579,7 @@ def get_user_permission_level(employee_id: str) -> int | None:
     - job_grade_level = 직급 권한 레벨
     """
 
-    employee_id = employee_id.strip().upper()
+    # employee_id = employee_id.strip().upper()
 
     query = {
         "query": {
@@ -595,6 +598,7 @@ def get_user_permission_level(employee_id: str) -> int | None:
     )
 
     hits = response["hits"]["hits"]
+    # print("response:", response)
 
     if not hits:
         return None

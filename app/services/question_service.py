@@ -49,7 +49,7 @@ def is_self_question(question: str) -> bool:
         "내꺼",
         "우리",
     ]
-
+    #any 하나라도 true면 true, 모두 false면 false / question에 self_keywords 중 하나라도 있으면 true, 없으면 false
     return any(keyword in question for keyword in self_keywords)
 
 

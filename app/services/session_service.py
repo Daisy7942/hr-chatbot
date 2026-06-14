@@ -41,6 +41,7 @@ def has_explicit_target(question: str) -> bool:
     if not question:
         return False
 
+    
     compact_question = compact_text(question)
 
     if extract_employee_id(question):
@@ -48,9 +49,10 @@ def has_explicit_target(question: str) -> bool:
 
     employee_name = extract_employee_name(question)
 
-    if employee_name and employee_name not in NOT_TARGET_NAMES:
+    if employee_name and (employee_name not in NOT_TARGET_NAMES):
         return True
 
+    #compact_question = 공백 제거된 질문 / DEPARTMENTS, TEAMS, POSITIONS에 있는 값이 compact_question에 하나라도 있으면 True, 없으면 False
     for value in DEPARTMENTS + TEAMS + POSITIONS:
         if value in compact_question:
             return True
@@ -91,8 +93,9 @@ def is_followup_question(question: str) -> bool:
 
     if any(keyword in compact_question for keyword in followup_keywords):
         return True
-
-    return "도" in compact_question and not has_explicit_target(question)
+    
+    # 명시된 대상이 없고, 질문에 "도"가 포함되어 있으면 후속 질문으로 판단한다.
+    return ("도" in compact_question) and (not has_explicit_target(question))
 
 
 def has_memory_applicable_keyword(question: str) -> bool:
@@ -200,21 +203,31 @@ def resolve_question_with_memory(question: str, requester_employee_id: str) -> s
     보안상 검색 결과나 민감정보는 사용하지 않고, 대상 식별자만 사용한다.
     """
 
+    # 질문이 비어 있으면 보정할 수 없으므로 그대로 반환한다.
     if not question:
         return question
 
+    # "내 연봉", "내 부서"처럼 본인 조회는 이전 대화 대상과 섞이면 안 되므로 그대로 둔다.
     if is_self_question(question):
         return question
 
+    # 질문 안에 직원/사번/부서/팀/직책 같은 조회 대상이 이미 있으면 memory를 붙이지 않는다.
+    # 예: "김민수 이메일 알려줘", "채용팀 계약직 알려줘"
     if has_explicit_target(question):
         return question
 
+    # 후속 질문도 아니고 HR 조회 항목도 없으면 이전 대상을 붙일 근거가 없다.
+    # 예: "고마워", "다시 설명해줘" 같은 일반 문장
     if not is_followup_question(question) and not has_memory_applicable_keyword(question):
         return question
 
+    # conversation_memory에서 requester_employee_id로 기억된 대상을 가져온다.
     memory = conversation_memory.get(requester_employee_id, {})
+    # cleaned_question = question에서 후속 질문 표현 제거 ex) "그 사람 이메일도 알려줘" -> "이메일도 알려줘"
     cleaned_question = remove_followup_reference(question)
 
+    # 이전에 특정 직원을 조회했다면 그 직원을 이번 질문의 대상으로 붙인다.
+    # 예: 이전 "김민수 부서 알려줘" 이후 "이메일도 알려줘" -> "김민수 이메일도 알려줘"
     employee_target = (
         memory.get("last_employee_name")
         or memory.get("last_employee_id")
@@ -223,6 +236,8 @@ def resolve_question_with_memory(question: str, requester_employee_id: str) -> s
     if employee_target:
         return f"{employee_target} {cleaned_question}"
 
+    # 이전에 특정 조직을 조회했다면 그 조직을 이번 질문의 대상으로 붙인다.
+    # 예: 이전 "채용팀 직원 알려줘" 이후 "계약직도 알려줘" -> "채용팀 계약직도 알려줘"
     org_target = (
         memory.get("last_team")
         or memory.get("last_department")
@@ -232,7 +247,9 @@ def resolve_question_with_memory(question: str, requester_employee_id: str) -> s
     if org_target:
         return f"{org_target} {cleaned_question}"
 
+    # 사용할 memory가 없으면 질문을 그대로 반환한다.
     return question
+
 
 
 def update_memory_from_tasks(
