@@ -238,6 +238,49 @@ def remove_hallucinated_org_filters(
 
     return safe_filters
 
+def remove_ambiguous_previous_task_filter(
+    filters: list[dict],
+    original_question: str,
+    task: dict,
+) -> list[dict]:
+    """
+    '개발 관련 업무담당자' 같은 질문에서
+    LLM이 previous_task 조건을 잘못 만든 경우 제거한다.
+
+    previous_task는 '이전담당업무'다.
+    사용자가 명확히 이전 업무/경력/이전담당업무를 물어본 게 아니면
+    부서/팀 담당자 조회로 처리한다.
+    """
+
+    if not filters:
+        return filters
+
+    compact_question = compact_text(original_question)
+
+    explicit_previous_task_keywords = [
+        "이전담당업무",
+        "이전업무",
+        "이전직무",
+        "이전경력",
+        "경력",
+        "전직장",
+        "전에하던업무",
+    ]
+
+    # 사용자가 진짜 previous_task를 물어본 경우는 제거하면 안 된다.
+    if any(keyword in compact_question for keyword in explicit_previous_task_keywords):
+        return filters
+
+    # 부서/팀이 잡힌 상태에서 previous_task가 끼어든 경우만 제거한다.
+    if not (task.get("department") or task.get("team")):
+        return filters
+
+    return [
+        item
+        for item in filters
+        if item.get("field") != "previous_task"
+    ]
+
 
 # 놓친 조건이 filters에 빠져 있으면 추가하는 함수
 # filters의 예시 : filters = [{"field": "department", "op": "eq", "value": "마케팅부"},
@@ -609,7 +652,7 @@ def process_task(
     # LLM이 만든 filters를 바로 쓰지 않고 허용 필드/연산자/조직 값 기준으로 정리한다.
     filters = sanitize_filters(task.get("filters", []))
 
-    filters = remove_hallucinated_org_filters(
+    filters = remove_ambiguous_previous_task_filter(
         filters=filters,
         original_question=original_question,
         task=task,
@@ -874,10 +917,10 @@ def process_task(
 
     # 조직/직책만 묻는 단순 직원 목록은 직접 조건 검색.
     if (
-        intent == "employee_list"
+        intent in {"employee_list", "condition_search"}
         and (task.get("department") or task.get("team") or task.get("position"))
         and set(answer_fields) == {"employee"}
-        and not has_non_org_filters(filters) #추가조건이 있는 지 확인
+        and not has_non_org_filters(filters)
     ):
         direct_search_start_time = time.perf_counter()
 
