@@ -1118,6 +1118,7 @@ def build_index_body(security_level):
                 'tokenizer': {
                     'nori_tokenizer': {
                         'type': 'nori_tokenizer',
+                        'decompound_mode': 'mixed',
                         'user_dictionary': 'user_dictionary.txt',
                     }
                 },

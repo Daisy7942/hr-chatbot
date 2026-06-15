@@ -12,9 +12,6 @@ data/dataset/*.csv
 # 전처리 에러 로그 (실행할 때마다 자동 생성)
 data/error.log
 
-# 인덱싱 상태 파일 (실행할 때마다 자동 생성·갱신되며 환경마다 값이 다름)
-config/last_user_dictionary.txt
-
 # 벡터 DB
 vector_db/
 
@@ -30,16 +27,6 @@ __pycache__/
 # Jupyter 노트북
 *.ipynb
 .ipynb_checkpoints/
-
-# RAG 실습 파일
-01_RAG_실습*.ipynb
-RAG_코딩가이드.md
-
-# Claude 생성 문서
-preprocessing_policy.md
-
-# 참고 문서
-참고/
 
 # 문서 파일
 *.pdf
