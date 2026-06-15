@@ -17,9 +17,14 @@ print('라이브러리 로딩 완료!')
 # ══════════════════════════════════════════════════════════════════════════════
 # 경로 · 설정
 # ══════════════════════════════════════════════════════════════════════════════
-# 이 파일은 4단계(전처리 → JSONL 변환 → 청킹 → 인덱싱)를 하나로 합친 파이프라인이다.
+# 이 파일은 3단계(전처리 → JSONL 변환 → 인덱싱)를 하나로 합친 파이프라인이다.
 # 단계 사이의 데이터는 파일이 아니라 메모리(변수)로 직접 넘긴다.
 # 변경 감지(증분 적재)는 OpenSearch에 이미 적재된 값과 비교해서 판단한다.
+#
+# 청킹은 별도 단계가 아니라 인덱싱 단계 안에서 인덱스별로 수행한다.
+# (전체 필드를 한꺼번에 청킹하면 인덱스에 안 들어갈 필드까지 토큰을 차지해
+#  같은 인덱스의 필드가 여러 청크에 흩어진다. 인덱스별로 필요한 필드만 골라
+#  청킹해야 한 인덱스 안의 필드가 같은 청크에 모인다.)
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / '.env')
@@ -296,7 +301,7 @@ def validate_empid(df):
         if raw:
             emp_id = str(raw).strip()
         else:
-            emp_id = ' '
+            emp_id = ''
         if not emp_id or emp_id in ('nan', 'NaN'):
             log(row, emp_id, '사원번호', emp_id, '결측')
             drop_rows.add(row)
@@ -542,8 +547,6 @@ def validate_career(df):
                 if cell_value in ('nan', 'NaN'):
                     cell_value = ''
                 if not cell_value:
-                    if hire_route == '경력':
-                        log(row, df.at[row, '사원번호'], col, cell_value, '채용경로=경력인데 결측')
                     df.at[row, col] = '미입력'
 
 
@@ -725,7 +728,7 @@ def validate_salary(df):
             continue
         for row, raw in df[col].items():
             try:
-                val = int(raw)
+                val = int(float(raw))
             except Exception:
                 log(row, df.at[row, '사원번호'], col, raw, '숫자 변환 불가')
                 df.at[row, col] = '미입력'
@@ -985,7 +988,8 @@ def run_jsonl_conversion(dfs_clean):
     print('\n========== 2단계: JSONL 변환 ==========')
 
     # 기본인사정보에서 이름/부서/직급을 사원번호로 찾아 쓰기 위한 조회 딕셔너리
-    basic_df = dfs_clean.get('기본인사정보_정제', pd.DataFrame())
+    basic_key = next((k for k in dfs_clean if '기본인사정보' in k), None)
+    basic_df = dfs_clean.get(basic_key, pd.DataFrame()) if basic_key else pd.DataFrame()
     basic_lookup = {}
     if not basic_df.empty:
         for row in basic_df.to_dict('records'):
@@ -1015,10 +1019,14 @@ def run_jsonl_conversion(dfs_clean):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3단계: 청킹
+# 청킹 헬퍼 (인덱싱 단계 안에서 호출된다)
 # ══════════════════════════════════════════════════════════════════════════════
-# 직원 레코드의 embedding_text를 토큰 한계에 맞춰 여러 청크로 나눈다.
-# 한 직원에게 청크가 여러 개 나올 수 있다.
+# 청킹은 별도 단계가 아니라 인덱싱(3단계) 안에서 인덱스별로 호출한다.
+# - 이유: 인덱스마다 들어가는 필드 목록이 다른데, 전체 필드를 미리 청킹하면
+#         그 인덱스에 안 들어갈 필드까지 토큰을 차지해 같은 인덱스의 필드가
+#         여러 청크에 흩어진다 (예: hr_basic_3 의 주민등록번호와 주소가 다른 청크).
+# - 해결: 인덱스별로 필요한 필드만 먼저 골라낸 뒤, 그 필터링된 텍스트를
+#         MAX_TOKENS 기준으로 청킹한다. 각 인덱스의 필드가 같은 청크에 모인다.
 
 def normalize_text(text):
     # 필드 줄 단위로 공백을 정리한다 (줄바꿈 구조는 유지).
@@ -1072,70 +1080,8 @@ def chunk_by_tokens(embedding_text, max_tokens, tokenizer):
     return chunks
 
 
-def run_chunking(records_by_source, tokenizer):
-    # 직원 레코드를 청크 레코드 리스트로 바꿔 소스별로 모아 반환한다.
-    print('\n========== 3단계: 청킹 ==========')
-
-    chunked_by_source = {}
-    empty_text_count = 0
-    chunking_errors = []   # 청킹 경고 모음 (마지막에 error.log로 남긴다)
-
-    for source_name, records in records_by_source.items():
-        chunks = []
-        for rec in records:
-            normalized = normalize_text(rec.get('embedding_text', ''))
-            rec['embedding_text'] = normalized
-            # 빈 embedding_text 방어 로직
-            if not normalized.strip():
-                emp_id = rec.get('employee_id', '?')
-                print(f'  경고: embedding_text 비어있음 → 사원 {emp_id} 스킵')
-                empty_text_count += 1
-                chunking_errors.append({
-                    '사원번호': emp_id,
-                    '사유':    '빈 embedding_text로 스킵',
-                    '상세':    source_name,
-                })
-                continue
-            chunk_texts = chunk_by_tokens(normalized, MAX_TOKENS, tokenizer)
-            for chunk_text in chunk_texts:
-                chunk_record = {
-                    'employee_id':      rec.get('employee_id', ''),
-                    'employee_name':    rec.get('employee_name', ''),
-                    'department':       rec.get('department', ''),
-                    'department_level': rec.get('department_level', ''),
-                    'job_grade':        rec.get('job_grade', ''),
-                    'job_grade_level':  rec.get('job_grade_level', ''),
-                    'embedding_text':   chunk_text,
-                    'source':           rec.get('source', ''),
-                }
-                chunks.append(chunk_record)
-
-        # 토큰 한계를 넘은 청크가 있으면 경고 (정상 청킹이면 0건)
-        # 0건이 아니면 필드 하나가 MAX_TOKENS보다 길다는 뜻이라, 임베딩 시 뒷부분이 잘릴 수 있다.
-        over_chunks = []
-        for chunk_record in chunks:
-            token_count = len(tokenizer.encode(chunk_record['embedding_text']))
-            if token_count > MAX_TOKENS:
-                over_chunks.append((chunk_record.get('employee_id', '?'), token_count))
-
-        chunked_by_source[source_name] = chunks
-        print(f'  청킹: {source_name}  원본 {len(records):,}건 → 청크 {len(chunks):,}건')
-        if over_chunks:
-            print(f'    토큰 초과 {len(over_chunks)}건:')
-            for emp_id, token_count in over_chunks:
-                print(f'      경고: 사원 {emp_id} 청크 {token_count}토큰 > 한계 {MAX_TOKENS} → 임베딩 시 잘릴 수 있음')
-                chunking_errors.append({
-                    '사원번호': emp_id,
-                    '사유':    '토큰 한계 초과',
-                    '상세':    f'{token_count}토큰 > 한계 {MAX_TOKENS} (임베딩 시 잘릴 수 있음)',
-                })
-
-    print(f'청킹 완료 (빈 embedding_text 스킵: {empty_text_count}건)')
-    return chunked_by_source, chunking_errors
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-# 4단계: 인덱싱 + 변경감지
+# 3단계: 인덱싱 (인덱스별 청킹 + 변경감지)
 # ══════════════════════════════════════════════════════════════════════════════
 # 청크를 인덱스별(보안등급별)로 라우팅하면서, OpenSearch에 이미 있는 값과 비교해
 # 바뀐 직원만 다시 임베딩·적재한다. 어떤 필드가 바뀌었는지는 changed에 기록한다.
@@ -1417,20 +1363,29 @@ def build_change_entry(old_meta, new_meta, old_text, new_text, now):
     return {'timestamp': now, 'fields': changed_fields}
 
 
-def run_indexing(chunks_by_source, model, client):
-    # 청크를 인덱스별로 라우팅하면서, OpenSearch에 이미 있는 값과 비교해 바뀐 직원만 재적재한다.
-    print('\n========== 4단계: 인덱싱 + 변경감지 ==========')
+def run_indexing(records_by_source, model, client):
+    # 인덱스별로 (필드 필터링 → 청킹 → 임베딩 → 변경감지 → 적재) 를 한 번에 수행한다.
+    # 청킹이 이 함수 안에 들어와 있는 이유는 파일 상단 주석 참고.
+    print('\n========== 3단계: 인덱싱 (인덱스별 청킹 + 변경감지) ==========')
+
+    tokenizer = model.tokenizer
 
     # 이번 실행의 적재 시각. 실제로 저장하는 문서(신규·변경)에만 이 시각을 찍는다.
     indexed_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     indexing_errors = []   # 적재 실패 모음 (마지막에 error.log로 남긴다)
+    chunking_errors = []   # 청킹 경고 모음 (마지막에 error.log로 남긴다)
 
-    # 모든 소스의 청크를 하나로 모은다 (인덱스 라우팅은 필드로 하므로 소스 구분은 불필요)
-    all_chunks = []
-    for source_name in chunks_by_source:
-        for chunk in chunks_by_source[source_name]:
-            all_chunks.append(chunk)
+    # 직원별로 모든 소스(기본인사정보 / 역량성과 / 급여정보)의 필드를 하나로 합친다.
+    # 인덱스가 어느 소스 필드를 쓰든 한 곳에서 꺼낼 수 있게 만든다.
+    employees = {}   # 사원번호 -> {'meta': 레코드(이름/부서/직급 등), 'parsed': {필드: 값, ...}}
+    for source_name in records_by_source:
+        for rec in records_by_source[source_name]:
+            emp_id = rec.get('employee_id', '')
+            parsed = parse_embedding_text(rec.get('embedding_text', ''))
+            if emp_id not in employees:
+                employees[emp_id] = {'meta': rec, 'parsed': {}}
+            employees[emp_id]['parsed'].update(parsed)
 
     for index_name, config in INDEX_CONFIG.items():
         fields = config['fields']
@@ -1438,17 +1393,35 @@ def run_indexing(chunks_by_source, model, client):
         # (가) 이 인덱스에 이미 있는 직원별 '옛 텍스트' + '옛 변경이력'
         old_data = get_existing_docs(client, index_name)
 
-        # (나) 이 인덱스로 갈 청크를 직원별로 모은다 (이 인덱스 필드만 남긴 텍스트)
-        new_by_emp = {}   # 사원번호 -> {'meta': 청크 하나(공통 메타), 'chunk_texts': [필터링된 텍스트, ...]}
-        for chunk in all_chunks:
-            parsed = parse_embedding_text(chunk.get('embedding_text', ''))
-            filtered = build_filtered_text(parsed, fields)
+        # (나) 인덱스별 필드 필터링 → 청킹
+        # 이 인덱스에 들어갈 필드만 골라낸 뒤 그 텍스트를 MAX_TOKENS 기준으로 청킹한다.
+        # → 이 인덱스의 필드끼리만 같은 청크 안에 모이게 된다.
+        new_by_emp = {}   # 사원번호 -> {'meta': 레코드, 'chunk_texts': [청크텍스트, ...]}
+        for emp_id in employees:
+            info = employees[emp_id]
+            filtered = build_filtered_text(info['parsed'], fields)
             if not filtered:
                 continue
-            emp_id = chunk.get('employee_id', '')
-            if emp_id not in new_by_emp:
-                new_by_emp[emp_id] = {'meta': chunk, 'chunk_texts': []}
-            new_by_emp[emp_id]['chunk_texts'].append(filtered)
+            normalized = normalize_text(filtered)
+            if not normalized.strip():
+                chunking_errors.append({
+                    '사원번호': emp_id,
+                    '사유':    '빈 embedding_text로 스킵',
+                    '상세':    index_name,
+                })
+                continue
+            chunk_texts = chunk_by_tokens(normalized, MAX_TOKENS, tokenizer)
+            new_by_emp[emp_id] = {'meta': info['meta'], 'chunk_texts': chunk_texts}
+
+            # 토큰 한계 초과 경고 (필드 하나가 MAX_TOKENS보다 길면 임베딩 시 뒷부분이 잘림)
+            for chunk_text in chunk_texts:
+                token_count = len(tokenizer.encode(chunk_text))
+                if token_count > MAX_TOKENS:
+                    chunking_errors.append({
+                        '사원번호': emp_id,
+                        '사유':    '토큰 한계 초과',
+                        '상세':    f'{index_name}: {token_count}토큰 > 한계 {MAX_TOKENS} (임베딩 시 잘릴 수 있음)',
+                    })
 
         # (다) 비교: 신규 / 변경 / 무변경으로 분류하고, 적재할 것만 추린다
         #      texts_to_embed 와 plan 은 같은 순서로 쌓아 임베딩 결과와 짝을 맞춘다.
@@ -1548,7 +1521,7 @@ def run_indexing(chunks_by_source, model, client):
                     '오류':    str(info.get('error', '')),
                 })
 
-    return indexing_errors
+    return indexing_errors, chunking_errors
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1556,19 +1529,20 @@ def run_indexing(chunks_by_source, model, client):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def write_error_log(preprocessing_errors, chunking_errors, indexing_errors):
-    # 1~4단계에서 나온 문제를 한 파일(error.log)에 단계별로 구분해 남긴다 (점검용 로그).
+    # 1~3단계에서 나온 문제를 한 파일(error.log)에 단계별로 구분해 남긴다 (점검용 로그).
     # 단계마다 항목 성격이 달라 컬럼도 다르므로, 섹션 헤더로 나눈다.
+    # 청킹은 3단계 인덱싱 안에서 일어나므로 청킹 경고와 적재 실패 모두 3단계 섹션에 들어간다.
     os.makedirs(ERROR_LOG_PATH.parent, exist_ok=True)
     with open(ERROR_LOG_PATH, 'w', encoding='utf-8-sig') as log_file:
         log_file.write('========== 1단계: 전처리 에러 ==========\n')
         columns = ['파일명', '행', '사원번호', '컬럼', '원본값', '사유']
         log_file.write(pd.DataFrame(preprocessing_errors, columns=columns).to_csv(index=False))
 
-        log_file.write('\n========== 3단계: 청킹 경고 ==========\n')
+        log_file.write('\n========== 3단계: 청킹 경고 (인덱싱 내) ==========\n')
         columns = ['사원번호', '사유', '상세']
         log_file.write(pd.DataFrame(chunking_errors, columns=columns).to_csv(index=False))
 
-        log_file.write('\n========== 4단계: 적재 실패 ==========\n')
+        log_file.write('\n========== 3단계: 적재 실패 ==========\n')
         columns = ['인덱스명', '문서ID', '오류']
         log_file.write(pd.DataFrame(indexing_errors, columns=columns).to_csv(index=False))
 
@@ -1607,12 +1581,12 @@ def main():
     create_indices(client)
 
     # 파이프라인 실행 (단계 사이 데이터는 파일이 아니라 메모리로 전달)
+    # 청킹은 별도 단계가 아니라 run_indexing 안에서 인덱스별로 수행된다.
     dfs_clean, preprocessing_errors = run_preprocessing()
     records_by_source               = run_jsonl_conversion(dfs_clean)
-    chunks_by_source, chunking_errors = run_chunking(records_by_source, model.tokenizer)
-    indexing_errors                 = run_indexing(chunks_by_source, model, client)
+    indexing_errors, chunking_errors = run_indexing(records_by_source, model, client)
 
-    # 1~4단계 에러를 한 파일에 단계별로 구분해 남긴다
+    # 1~3단계 에러를 한 파일에 단계별로 구분해 남긴다
     write_error_log(preprocessing_errors, chunking_errors, indexing_errors)
 
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
