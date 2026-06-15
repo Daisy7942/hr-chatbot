@@ -5,6 +5,7 @@ from app.services.llm_service import generate_answer
 from app.services.question_service import (
     extract_employee_id,
     extract_employee_name,
+    is_self_question,
 )
 from app.services.hybrid_search_service import (
     ACCESSIBLE_INDICES,
@@ -591,6 +592,13 @@ def process_task(
             },
         }
 
+    if intent == "single_lookup" and not bool(task.get("is_self", False)):
+        if not task.get("employee_name") and not task.get("employee_id"):
+            guessed_name = extract_employee_name(original_question)
+
+            if guessed_name:
+                task["employee_name"] = guessed_name
+
     has_explicit_target = any(
         task.get(key)
         for key in ["employee_name", "employee_id", "department", "team", "position"]
@@ -600,6 +608,7 @@ def process_task(
         intent == "single_lookup"
         and not filters
         and not has_explicit_target
+        and is_self_question(original_question)
     ):
         task["is_self"] = True
 

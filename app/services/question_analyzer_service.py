@@ -347,6 +347,27 @@ def normalize_semantic_filters(filters: list[dict], question: str) -> list[dict]
     return normalized_filters
 
 
+def normalize_hire_year_filter(filters: list[dict], question: str) -> list[dict]:
+    compact_question = compact_text(question)
+
+    if "입사" not in compact_question:
+        return filters
+
+    year_match = re.search(r"(19|20)\d{2}", compact_question)
+
+    if not year_match:
+        return filters
+
+    year = year_match.group()
+
+    return add_filter_if_missing(
+        filters=filters,
+        field="hire_date",
+        op="contains",
+        value=year,
+    )
+
+
 def normalize_target_fields_by_question(
     target_fields: list[str],
     question: str,
@@ -594,355 +615,72 @@ def add_filter_if_missing(
 def analyze_question_to_tasks(question: str) -> dict:
     field_schema_text = build_field_schema_text()
 
-    department_list_text = ", ".join(DEPARTMENTS)
-    team_list_text = ", ".join(TEAMS)
-    position_list_text = ", ".join(POSITIONS)
 
     prompt = f"""
-너는 HR RAG 챗봇의 질문 분석기입니다.
+You are a parser for a Korean HR RAG API.
+Return only one valid JSON object. Do not use markdown.
 
-너의 역할은 사용자의 질문을 하나 이상의 task 객체로 나누는 것입니다.
-권한 판단은 하지 마세요.
-사용자에게 답변하지 마세요.
-반드시 JSON만 반환하세요.
+Allowed intents:
+- single_lookup: ask one employee's field
+- employee_list: ask employees in an org/position
+- category_list: ask available department/team/job_grade/position values
+- condition_search: ask employees or fields matching filters
+- unknown: cannot classify
 
-사용 가능한 intent 값:
-- single_lookup: 특정 직원 또는 본인의 특정 정보를 묻는 질문
-- employee_list: 특정 부서, 팀, 직책에 해당하는 직원 목록을 묻는 질문
-- category_list: 부서, 팀, 직급, 직책 같은 종류/목록을 묻는 질문
-- condition_search: 조건에 맞는 직원을 찾거나, 조건에 맞는 직원의 특정 정보를 묻는 질문
-- unknown: 분류하기 어려운 질문
-
-사용 가능한 HR 필드:
+Allowed fields:
 {field_schema_text}
 
-부서 리스트:
-{department_list_text}
+Rules:
+- target_fields are the fields the user wants to see.
+- filters are search conditions, not answer fields.
+- If the question means "me", "my", "나", "내", or "본인", set is_self true.
+- Self words are: "\ub098", "\ub0b4", "\ubcf8\uc778", "\ub0b4\uc774\ub984".
+- For self questions, keep employee_name null unless another person's real name is mentioned.
+- Never set employee_name to "\ub098", "\ub0b4", "\ubcf8\uc778", "\ub0b4\uc774\ub984", or any phrase that means the requester.
+- Do not invent employee_id. Only set employee_id when the question contains an EMP number.
+- If a person name is mentioned, set employee_name.
+- Use only allowed fields. If unsure, use ["unknown"].
+- Use filter ops only from: eq, contains, gt, gte, lt, lte, between.
+- Do not decide permissions.
 
-팀 리스트:
-{team_list_text}
-
-직책 리스트:
-{position_list_text}
-
-[가장 중요한 개념]
-
-target_fields와 filters를 반드시 구분하세요.
-
-target_fields:
-- 사용자가 답변으로 보고 싶은 정보입니다.
-- 예: "오민호 이메일 알려줘" -> target_fields는 ["email"]
-- 예: "채용팀의 계약직 알려줘" -> 답변으로 보고 싶은 것은 직원이므로 target_fields는 ["employee"]
-
-filters:
-- 검색 조건입니다.
-- 예: "채용팀의 계약직 알려줘"
-  - team = 채용팀
-  - contract_type = 계약직
-- 예: "마케팅부 정규직 이메일 알려줘"
-  - department = 마케팅부
-  - contract_type = 정규직
-  - 답변으로 보고 싶은 것은 이메일
-
-[반환 형식]
-
-반드시 아래 JSON 형식 그대로 반환하세요.
-
-{{
-  "tasks": [
-    {{
-      "intent": "condition_search",
-      "target_fields": ["employee"],
-      "employee_name": null,
-      "employee_id": null,
-      "department": null,
-      "team": null,
-      "position": null,
-      "filters": [
-        {{
-          "field": "team",
-          "op": "eq",
-          "value": "채용팀"
-        }},
-        {{
-          "field": "contract_type",
-          "op": "eq",
-          "value": "계약직"
-        }}
-      ],
-      "is_self": false
-    }}
-  ]
-}}
-
-[공통 규칙]
-
-- 권한 판단은 절대 하지 마세요.
-- 사용자가 직접 요청한 답변 필드만 target_fields에 넣으세요.
-- 검색 조건으로 쓰인 필드는 filters에 넣으세요.
-- filters의 field는 반드시 사용 가능한 HR 필드 중 하나를 사용하세요.
-- filters의 op는 eq, contains, gt, gte, lt, lte, between 중 하나를 사용하세요.
-- 정확히 일치하는 조건은 op를 eq로 설정하세요.
-- 포함 조건은 op를 contains로 설정하세요.
-- 이상 조건은 gte, 초과 조건은 gt를 사용하세요.
-- 이하 조건은 lte, 미만 조건은 lt를 사용하세요.
-- "성과점수 80점 이상"처럼 숫자 점수를 말한 경우에만 performance_score와 gte/lte/gt/lt를 사용하세요.
-- "평가가 우수한", "고과가 우수한"처럼 평가 등급을 말한 경우에는 최신 평가인 evaluation_2024를 사용하세요.
-- 평가 등급 표현은 실제 데이터 등급으로 바꾸세요. 우수/탁월/좋음은 A, 양호는 B, 보통은 C, 미흡/부진은 D입니다.
-- "2023년 평가가 우수한"처럼 연도가 있으면 evaluation_2023 eq "A"처럼 해당 연도 필드를 사용하세요.
-- 숫자가 없는 "우수한 평가"를 임의로 80점 이상으로 바꾸지 마세요.
-- 본인 정보를 묻는 경우 is_self를 true로 설정하세요.
-- 직원 이름이 있으면 employee_name에 넣으세요.
-- EMP0001 같은 실제 사번이 있으면 employee_id에 넣으세요.
-- employee_id에는 EMP0001 같은 실제 사번만 넣으세요.
-- 사람 이름을 employee_id에 넣지 마세요.
-- 사원번호/사번을 물으면 target_fields는 employee_id입니다.
-- 주민등록번호/주민번호를 물으면 target_fields는 rrn입니다.
-- 주민등록번호/주민번호를 employee_id로 분석하지 마세요.
-- 실제 부서 목록 중 하나가 포함되면 department에도 넣고 filters에도 넣으세요.
-- 실제 팀 목록 중 하나가 포함되면 team에도 넣고 filters에도 넣으세요.
-- 실제 직책 목록 중 하나가 조건으로 포함되면 position에도 넣고 filters에도 넣으세요.
-- "영업 관련", "영업쪽", "영업 담당"처럼 조직 별칭 표현은 영업부 조건으로 분석하세요.
-- "채용 관련", "채용쪽", "채용 담당"처럼 팀 별칭 표현은 채용팀 조건으로 분석하세요.
-- "팀"과 "팀장/팀원"은 다릅니다. "팀장", "팀원"은 team이 아니라 position입니다.
-- 사용자가 여러 개의 독립된 질문을 하면 task를 여러 개로 나누세요.
-
-[분류 규칙]
-
-1. 특정 직원 또는 본인의 정보를 묻는 질문
-- intent는 single_lookup입니다.
-- 예: "오민호 이메일 알려줘"
-- 예: "내 입사일 알려줘"
-
-2. 직원 목록을 묻는 질문
-- intent는 employee_list 또는 condition_search입니다.
-- 단순 부서/팀/직책 직원 목록이면 employee_list입니다.
-- 조건이 붙으면 condition_search입니다.
-
-3. 조건 검색
-- "계약직", "정규직", "성과점수 80점 이상", "TOEIC 900점 이상"처럼 조건이 있으면 filters에 넣으세요.
-- "평가가 우수한", "고과가 우수한"처럼 평가 등급 조건이 있으면 evaluation_2024 eq "A"를 filters에 넣으세요.
-- 조건에 맞는 직원을 묻는 질문이면 target_fields는 ["employee"]입니다.
-- 조건에 맞는 직원의 이메일/연봉/주소 등을 묻는 질문이면 target_fields는 해당 필드입니다.
-
-4. 목록/종류 질문
-- "종류", "목록", "리스트", "전체 부서", "어떤 부서", "부서 뭐 있어"처럼 실제 목록을 묻는 경우만 category_list입니다.
-- "인사부 알려줘"처럼 실제 부서명만 말하고 알려달라는 경우는 category_list가 아닙니다.
-- 이 경우는 employee_list 또는 condition_search입니다.
-
-[필드 매핑 예시]
-
-- 사원번호, 사번 -> employee_id
-- 이름 -> employee_name
-- 성별 -> gender
-- 나이 -> age
-- 생년월일 -> birth_date
-- 주민등록번호, 주민번호 -> rrn
-- 병역 -> military
-- 입사일 -> hire_date
-- 근속기간 -> tenure
-- 학력 -> education
-- 출신대학 -> university
-- 학점 -> gpa
-- 채용경로 -> hire_path
-- 계약형태, 계약직, 정규직 -> contract_type
-- 이전직장명 -> previous_company
-- 이전최종직급 -> previous_job_grade
-- 이전담당업무 -> previous_task
-- 회사명 -> company
-- 사업장위치 -> work_location
+Field hints:
+- \uc774\ub984, \uc131\uba85, \ub0b4\uc774\ub984 -> employee_name
+- \uc0ac\ubc88, \uc9c1\uc6d0\ubc88\ud638 -> employee_id
+- \ubd80\uc11c -> department
+- \ud300 -> team
+- \uc9c1\uae09 -> job_grade
+- \uc9c1\ucc45, \ud3ec\uc9c0\uc158 -> position
+- \uc774\uba54\uc77c, \uba54\uc77c -> email
+- \uc804\ud654\ubc88\ud638, \uc5f0\ub77d\ucc98, \ud734\ub300\ud3f0 -> phone
+- \uc8fc\uc18c -> address
+- \uc5f0\ubd09, \uae09\uc5ec -> salary
+- \uc785\uc0ac\uc77c -> hire_date
+- \uacc4\uc57d\uc9c1, \uc815\uaddc\uc9c1, \uacc4\uc57d\ud615\ud0dc -> contract_type
+- \uc131\uacfc\uc810\uc218 -> performance_score
+- \ud3c9\uac00, \uace0\uacfc, \uc778\uc0ac\ud3c9\uac00 -> evaluation_2024
+- \uc8fc\ubbfc\ub4f1\ub85d\ubc88\ud638, \uc8fc\ubbfc\ubc88\ud638 -> rrn
+- 이름, 성명, 내이름 -> employee_name
+- 사번, 직원번호 -> employee_id
 - 부서 -> department
 - 팀 -> team
-- 부서레벨 -> department_level
 - 직급 -> job_grade
-- 직책 -> position
-- 직급레벨 -> job_grade_level
-- 퇴직구분 -> retirement_type
-- 퇴직일자 -> retirement_date
+- 직책, 포지션 -> position
 - 이메일, 메일 -> email
-- 전화번호, 연락처 -> phone
+- 전화번호, 연락처, 휴대폰 -> phone
 - 주소 -> address
-- 연봉 -> salary
-- 잔업시간 -> overtime
-- 미사용휴가일수 -> unused_vacation
-- 급여은행 -> salary_bank
-- 계좌번호 -> account
-- 4대보험가입여부 -> insurance
+- 연봉, 급여 -> salary
+- 입사일 -> hire_date
+- 계약직, 정규직, 계약형태 -> contract_type
 - 성과점수 -> performance_score
-- 평가, 인사평가, 고과, 인사고과 -> evaluation_2024
-- 2020년 평가 -> evaluation_2020
-- 2021년 평가 -> evaluation_2021
-- 2022년 평가 -> evaluation_2022
-- 2023년 평가 -> evaluation_2023
-- 2024년 평가 -> evaluation_2024
-- 자격증 -> certificate
-- TOEIC, 토익 -> toeic
-- 자격증수당여부 -> certificate_allowance
-- 포상이력 -> award_history
-- 징계이력 -> disciplinary_history
-- 징계사유 -> disciplinary_reason
+- 평가, 고과, 인사평가 -> evaluation_2024
+- 주민등록번호, 주민번호 -> rrn
 
-[예시 1]
-질문: "오민호 이메일 알려줘"
-답변:
+Return this exact shape:
 {{
   "tasks": [
     {{
       "intent": "single_lookup",
-      "target_fields": ["email"],
-      "employee_name": "오민호",
-      "employee_id": null,
-      "department": null,
-      "team": null,
-      "position": null,
-      "filters": [],
-      "is_self": false
-    }}
-  ]
-}}
-
-[예시 2]
-질문: "내 주소랑 전화번호 알려줘"
-답변:
-{{
-  "tasks": [
-    {{
-      "intent": "single_lookup",
-      "target_fields": ["address", "phone"],
-      "employee_name": null,
-      "employee_id": null,
-      "department": null,
-      "team": null,
-      "position": null,
-      "filters": [],
-      "is_self": true
-    }}
-  ]
-}}
-
-[예시 3]
-질문: "채용팀의 계약직 알려줘"
-답변:
-{{
-  "tasks": [
-    {{
-      "intent": "condition_search",
-      "target_fields": ["employee"],
-      "employee_name": null,
-      "employee_id": null,
-      "department": null,
-      "team": "채용팀",
-      "position": null,
-      "filters": [
-        {{
-          "field": "team",
-          "op": "eq",
-          "value": "채용팀"
-        }},
-        {{
-          "field": "contract_type",
-          "op": "eq",
-          "value": "계약직"
-        }}
-      ],
-      "is_self": false
-    }}
-  ]
-}}
-
-[예시 4]
-질문: "마케팅부 정규직 이메일 알려줘"
-답변:
-{{
-  "tasks": [
-    {{
-      "intent": "condition_search",
-      "target_fields": ["email"],
-      "employee_name": null,
-      "employee_id": null,
-      "department": "마케팅부",
-      "team": null,
-      "position": null,
-      "filters": [
-        {{
-          "field": "department",
-          "op": "eq",
-          "value": "마케팅부"
-        }},
-        {{
-          "field": "contract_type",
-          "op": "eq",
-          "value": "정규직"
-        }}
-      ],
-      "is_self": false
-    }}
-  ]
-}}
-
-[예시 5]
-질문: "성과점수 80점 이상 직원 알려줘"
-답변:
-{{
-  "tasks": [
-    {{
-      "intent": "condition_search",
-      "target_fields": ["employee"],
-      "employee_name": null,
-      "employee_id": null,
-      "department": null,
-      "team": null,
-      "position": null,
-      "filters": [
-        {{
-          "field": "performance_score",
-          "op": "gte",
-          "value": 80
-        }}
-      ],
-      "is_self": false
-    }}
-  ]
-}}
-
-[예시 6]
-질문: "평가가 우수한 계약직 알려줘"
-답변:
-{{
-  "tasks": [
-    {{
-      "intent": "condition_search",
-      "target_fields": ["employee"],
-      "employee_name": null,
-      "employee_id": null,
-      "department": null,
-      "team": null,
-      "position": null,
-      "filters": [
-        {{
-          "field": "evaluation_2024",
-          "op": "eq",
-          "value": "A"
-        }},
-        {{
-          "field": "contract_type",
-          "op": "eq",
-          "value": "계약직"
-        }}
-      ],
-      "is_self": false
-    }}
-  ]
-}}
-
-[예시 7]
-질문: "부서 종류 알려줘"
-답변:
-{{
-  "tasks": [
-    {{
-      "intent": "category_list",
-      "target_fields": ["department"],
+      "target_fields": ["employee_name"],
       "employee_name": null,
       "employee_id": null,
       "department": null,
@@ -954,57 +692,7 @@ filters:
   ]
 }}
 
-[예시 8]
-질문: "인사부 알려줘"
-답변:
-{{
-  "tasks": [
-    {{
-      "intent": "employee_list",
-      "target_fields": ["employee"],
-      "employee_name": null,
-      "employee_id": null,
-      "department": "인사부",
-      "team": null,
-      "position": null,
-      "filters": [
-        {{
-          "field": "department",
-          "op": "eq",
-          "value": "인사부"
-        }}
-      ],
-      "is_self": false
-    }}
-  ]
-}}
-
-[예시 9]
-질문: "영업 관련 직원 찾아줘"
-답변:
-{{
-  "tasks": [
-    {{
-      "intent": "employee_list",
-      "target_fields": ["employee"],
-      "employee_name": null,
-      "employee_id": null,
-      "department": "영업부",
-      "team": null,
-      "position": null,
-      "filters": [
-        {{
-          "field": "department",
-          "op": "eq",
-          "value": "영업부"
-        }}
-      ],
-      "is_self": false
-    }}
-  ]
-}}
-
-사용자 질문:
+User question:
 {question}
 """
 
@@ -1015,10 +703,11 @@ filters:
                 "model": MODEL_NAME,
                 "prompt": prompt,
                 "stream": False,
+                "format": "json",
                 "options": {
                     "temperature": 0,
-                    "num_predict": 1200, 
-                    # 토큰 수가 많은 복잡한 질문도 분석할 수 있게 늘린다. 답변이 잘리는 경우 이 값을 더 늘려본다.
+                    "num_predict": 400, 
+                    # Keep the parser output short so the JSON object closes reliably.
                 },
             },
             timeout=180,
@@ -1249,6 +938,7 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
         # "성과 좋은 직원" 같은 표현이 있으면
         # performance 관련 조건으로 보정할 수 있다.
         filters = normalize_semantic_filters(filters, question)
+        filters = normalize_hire_year_filter(filters, question)
 
         # 질문에서 부서가 확인되었으면 filters에 department 조건을 추가한다.
         #
@@ -1319,6 +1009,9 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
         if filters and intent == "unknown":
             intent = "condition_search"
 
+        if filters and intent == "employee_list":
+            intent = "condition_search"
+
         # filters는 있는데 target_fields를 못 잡은 경우
         # 최소한 직원 목록을 찾는 질문으로 보고 employee 필드를 사용한다.
         #
@@ -1328,6 +1021,9 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
         # target_fields: unknown
         # -> employee 목록 조회로 보정
         if filters and safe_fields == ["unknown"]:
+            safe_fields = ["employee"]
+
+        if filters and safe_fields == ["employee_name"]:
             safe_fields = ["employee"]
 
         # -------------------------
@@ -1341,11 +1037,22 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
         # 이름이 없으면 None
         employee_name, employee_id = normalize_employee_identity_fields(task)
 
+        if (
+            intent == "single_lookup"
+            and not bool(task.get("is_self", False))
+            and not employee_name
+            and not employee_id
+        ):
+            employee_name = extract_employee_name(question)
+
         # LLM이 "인사부", "마케팅부" 같은 조직명을
         # employee_name으로 잘못 넣는 경우가 있다.
         #
         # 그런 경우 직원 이름이 아니므로 None으로 제거한다.
         if is_org_alias_text(employee_name):
+            employee_name = None
+
+        if bool(task.get("is_self", False)):
             employee_name = None
 
         # -------------------------
