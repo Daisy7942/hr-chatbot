@@ -11,6 +11,7 @@ from app.services.question_service import (
 from app.services.hybrid_search_service import (
     ACCESSIBLE_INDICES,
     build_context,
+    count_employees_by_conditions,
     filter_hits_with_answer_values,
     get_allowed_field_value,
     get_category_values,
@@ -78,6 +79,27 @@ def build_category_answer(field_key: str, permission_level: int) -> str:
         + "\n".join([f"- {value}" for value in values])
     )
 
+def build_employee_count_answer(task: dict, count: int) -> str:
+    """
+    직원 수 조회 결과를 사용자 답변 문장으로 만든다.
+    """
+
+    conditions = []
+
+    if task.get("department"):
+        conditions.append(task["department"])
+
+    if task.get("team"):
+        conditions.append(task["team"])
+
+    if task.get("position"):
+        conditions.append(task["position"])
+
+    if conditions:
+        condition_text = " ".join(conditions)
+        return f"{condition_text} 직원 수는 {count}명입니다."
+
+    return f"직원 수는 {count}명입니다."
 
 def normalize_task_org_values(task: dict) -> dict:
     """
@@ -836,7 +858,7 @@ def process_task(
     allowed_fields = list(answer_fields)
     context_fields = unique_keep_order(answer_fields + allowed_filter_fields)
 
-    if intent in {"single_lookup", "employee_list", "condition_search"}:
+    if intent in {"single_lookup", "employee_list", "employee_count", "condition_search"}:
         if "employee" not in allowed_fields:
             allowed_fields.insert(0, "employee")
 
@@ -872,6 +894,47 @@ def process_task(
 
     # hybrid 검색에 사용할 질문 생성
     task_question = build_task_question(original_question, task)
+
+        # 직원 수 질문은 검색 결과 size에 의존하지 않고 OpenSearch count로 계산한다.
+    if intent == "employee_count":
+        count_start_time = time.perf_counter()
+
+        count = count_employees_by_conditions(
+            permission_level=search_permission_level,
+            department=task.get("department"),
+            team=task.get("team"),
+            position=task.get("position"),
+        )
+
+        answer = build_employee_count_answer(
+            task=task,
+            count=count,
+        )
+
+        if denied_message:
+            answer = f"{answer}\n\n{denied_message}"
+
+        print(
+            "[TIME] employee_count:",
+            f"{time.perf_counter() - count_start_time:.3f}s",
+        )
+        print(
+            "[TIME] process_task total:",
+            f"{time.perf_counter() - task_start_time:.3f}s",
+        )
+
+        return {
+            "answer": answer,
+            "sources": [],
+            "permission": {
+                "allowed": True,
+                "permission_level": permission_level,
+                "required_level": required_level,
+                "allowed_fields": answer_fields,
+                "denied_fields": denied_fields,
+                "is_self": is_self,
+            },
+        }
 
     # 카테고리 목록 질문은 hybrid 검색보다 전체 기본 인덱스 집계가 더 정확하다.
     if intent == "category_list":

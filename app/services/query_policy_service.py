@@ -391,6 +391,7 @@ FIELD_RULES = {
 ALLOWED_INTENTS = {
     "single_lookup",
     "employee_list",
+    "employee_count",
     "category_list",
     "condition_search",
     "unknown",

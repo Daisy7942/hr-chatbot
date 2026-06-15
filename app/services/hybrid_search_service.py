@@ -1252,6 +1252,78 @@ def search_employees_by_conditions(
 
     return hits
 
+def count_employees_by_conditions(
+    permission_level: int,
+    department: str | None = None,
+    team: str | None = None,
+    position: str | None = None,
+) -> int:
+    """
+    부서/팀/직책 조건에 맞는 직원 수를 OpenSearch count로 계산한다.
+
+    중요:
+    - 직원 수는 목록 size=50으로 세면 안 된다.
+    - hr_basic_1은 직원 기본 문서 기준으로 1명당 1문서라고 보고 count에 사용한다.
+    - hr_basic_2, hr_basic_3까지 같이 세면 같은 직원이 중복 집계될 수 있다.
+    """
+
+    accessible_basic_indices = get_basic_indices(permission_level)
+
+    indices = [
+        index
+        for index in accessible_basic_indices
+        if index == "hr_basic_1"
+    ]
+
+    if not indices:
+        return 0
+
+    filter_conditions = []
+
+    if department:
+        filter_conditions.append(
+            {"match_phrase": {"department": department}}
+        )
+
+    if team:
+        filter_conditions.append(
+            {"match_phrase": {"embedding_text": f"팀: {team}"}}
+        )
+
+    if position:
+        filter_conditions.append(
+            {"match_phrase": {"embedding_text": f"직책: {position}"}}
+        )
+
+    if filter_conditions:
+        query = {
+            "query": {
+                "bool": {
+                    "filter": filter_conditions
+                }
+            }
+        }
+    else:
+        query = {
+            "query": {
+                "match_all": {}
+            }
+        }
+
+    print("[DEBUG] 직원 수 count indices:", indices)
+    print("[DEBUG] 직원 수 count query:", query)
+
+    response = client.count(
+        index=indices,
+        body=query,
+    )
+
+    count = int(response.get("count", 0))
+
+    print("[DEBUG] 직원 수 count 결과:", count)
+
+    return count
+
 def search_managers(
     permission_level: int,
     department_or_team: str | None = None,

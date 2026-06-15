@@ -641,6 +641,7 @@ Return only one valid JSON object. Do not use markdown.
 Allowed intents:
 - single_lookup: ask one employee's field
 - employee_list: ask employees in an org/position
+- employee_count: ask how many employees match an org/position/condition
 - category_list: ask available department/team/job_grade/position values
 - condition_search: ask employees or fields matching filters
 - unknown: cannot classify
@@ -660,6 +661,7 @@ Rules:
 - Use only allowed fields. If unsure, use ["unknown"].
 - Use filter ops only from: eq, contains, gt, gte, lt, lte, between.
 - Do not decide permissions.
+- If the question asks "몇 명", "몇명", "인원수", "인원", "명수", or employee count, use intent employee_count and target_fields ["employee"].
 
 Field hints:
 - \uc774\ub984, \uc131\uba85, \ub0b4\uc774\ub984 -> employee_name
@@ -862,6 +864,22 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
         for keyword in list_keywords
     )
 
+    count_keywords = [
+        "몇명",
+        "인원수",
+        "인원",
+        "명수",
+        "총몇명",
+        "몇명이야",
+        "몇명인지",
+        "몇명돼",
+    ]
+
+    requested_employee_count = any(
+        keyword in compact_question
+        for keyword in count_keywords
+    )
+
     # 최종적으로 정리된 task들을 담을 리스트
     normalized_tasks = []
 
@@ -1052,6 +1070,9 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
             safe_fields = ["employee"]
 
         if filters and safe_fields == ["employee_name"]:
+            safe_fields = ["employee"]
+        if requested_employee_count:
+            intent = "employee_count"
             safe_fields = ["employee"]
 
         # -------------------------
