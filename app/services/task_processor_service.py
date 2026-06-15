@@ -3,6 +3,7 @@ import time
 
 from app.services.llm_service import generate_answer
 from app.services.question_service import (
+    compact_text,
     extract_employee_id,
     extract_employee_name,
     is_self_question,
@@ -163,6 +164,80 @@ def sanitize_filters(filters: list[dict]) -> list[dict]:
         )
 
     return safe_filters
+
+
+def value_appears_in_question(question: str, value) -> bool:
+    """
+    filter 값이 실제 질문에 있었는지 확인한다.
+    LLM이 만든 가짜 조직 조건을 막기 위한 안전장치다.
+    """
+
+    if not question or not value:
+        return False
+
+    return compact_text(str(value)) in compact_text(question)
+
+
+def remove_hallucinated_org_values(task: dict, original_question: str) -> dict:
+    """
+    특정 직원 조회에서 LLM이 만들어낸 department/team/position 값을 제거한다.
+
+    예:
+    질문: 오민호 부서 알려줘
+    잘못된 task: department=영업부
+    -> 영업부는 질문 원문에 없으므로 제거
+    """
+
+    normalized_task = task.copy()
+
+    has_employee_target = bool(
+        normalized_task.get("employee_name")
+        or normalized_task.get("employee_id")
+    )
+
+    if not has_employee_target:
+        return normalized_task
+
+    for key in ["department", "team", "position"]:
+        value = normalized_task.get(key)
+
+        if value and not value_appears_in_question(original_question, value):
+            normalized_task[key] = None
+
+    return normalized_task
+
+
+def remove_hallucinated_org_filters(
+    filters: list[dict],
+    original_question: str,
+    task: dict,
+) -> list[dict]:
+    """
+    특정 직원 조회에서 질문 원문에 없던 조직 filter를 제거한다.
+    """
+
+    has_employee_target = bool(
+        task.get("employee_name")
+        or task.get("employee_id")
+    )
+
+    if not has_employee_target:
+        return filters
+
+    safe_filters = []
+
+    for item in filters:
+        field = item.get("field")
+        value = item.get("value")
+
+        if field in {"department", "team", "position"}:
+            if not value_appears_in_question(original_question, value):
+                continue
+
+        safe_filters.append(item)
+
+    return safe_filters
+
 
 # 놓친 조건이 filters에 빠져 있으면 추가하는 함수
 # filters의 예시 : filters = [{"field": "department", "op": "eq", "value": "마케팅부"},
@@ -529,11 +604,18 @@ def process_task(
     # LLM이 추출한 조직 값은 반드시 코드의 조직 정책 목록으로 다시 검증한다.
     task = normalize_task_org_values(task)
 
+    task = remove_hallucinated_org_values(task, original_question)
+
     # LLM이 만든 filters를 바로 쓰지 않고 허용 필드/연산자/조직 값 기준으로 정리한다.
     filters = sanitize_filters(task.get("filters", []))
 
+    filters = remove_hallucinated_org_filters(
+        filters=filters,
+        original_question=original_question,
+        task=task,
+    )
     # LLM이 department 관련 조건을 놓쳤으면 filters에 추가한다.
-    if task.get("department"):
+    if task.get("department") and value_appears_in_question(original_question, task.get("department")):
         filters = add_filter_if_missing(
             filters=filters,
             field="department",
@@ -541,7 +623,7 @@ def process_task(
             value=task.get("department"),
         )
 
-    if task.get("team"):
+    if task.get("team") and value_appears_in_question(original_question, task.get("team")):
         filters = add_filter_if_missing(
             filters=filters,
             field="team",
@@ -552,7 +634,11 @@ def process_task(
 
     # 특정 직원 이름이 있으면 직급은 호칭일 수 있으므로, 이름이 없을 때만 position 필터를 추가한다.
     # ex) "김민수 대리의 부서 알려줘" -> position이 대리인 조건이지만, "김민수"를 대상으로 검색해야 하므로
-    if task.get("position") and not task.get("employee_name"):
+    if (
+        task.get("position")
+        and not task.get("employee_name")
+        and value_appears_in_question(original_question, task.get("position"))
+    ):
         filters = add_filter_if_missing(
             filters=filters,
             field="position",
@@ -598,6 +684,18 @@ def process_task(
 
             if guessed_name:
                 task["employee_name"] = guessed_name
+
+    if (
+        intent == "condition_search"
+        and not filters
+        and not task.get("employee_name")
+        and not task.get("employee_id")
+    ):
+        guessed_name = extract_employee_name(original_question)
+
+        if guessed_name:
+            task["employee_name"] = guessed_name
+            intent = "single_lookup"
 
     has_explicit_target = any(
         task.get(key)
@@ -877,7 +975,7 @@ def process_task(
     sources_start_time = time.perf_counter()
     sources = make_sources(
         search_hits,
-        allowed_fields=context_fields,
+        allowed_fields=allowed_fields,
     )
     print(
         "[TIME] make_sources:",

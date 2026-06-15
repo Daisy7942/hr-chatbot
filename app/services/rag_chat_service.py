@@ -13,6 +13,7 @@ from app.services.question_analyzer_service import (
 
 # 이전 대화 기억을 이용해서 후속 질문을 보강하는 함수들
 from app.services.session_service import (
+    reset_memory_if_employee_changed,
     resolve_question_with_memory,
     update_memory_from_tasks,
 )
@@ -42,6 +43,8 @@ def handle_rag_chat(question: str, employee_id: str) -> dict:
     # 사번 앞뒤 공백 제거 후 대문자로 통일
     # 예: emp0070 -> EMP0070
     employee_id = employee_id.strip().upper()
+
+    reset_memory_if_employee_changed(employee_id)
 
     # =========================
     # 1. 요청자 권한 조회

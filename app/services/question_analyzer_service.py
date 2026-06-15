@@ -108,6 +108,24 @@ def compact_text(text: str) -> str:
 
     return re.sub(r"\s+", "", text)
 
+def value_appears_in_question(question: str, value) -> bool:
+    """
+    값이 실제 질문 원문에 들어있는지 확인한다.
+
+    예:
+    질문: 오민호 부서 알려줘
+    value: 영업부
+    -> False
+
+    질문: 영업부 직원 알려줘
+    value: 영업부
+    -> True
+    """
+
+    if not question or not value:
+        return False
+
+    return compact_text(str(value)) in compact_text(question)
 
 def build_fallback_analysis(question: str) -> dict:
     """
@@ -910,16 +928,26 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
 
         # LLM이 준 department가 실제 DEPARTMENTS 목록에 있으면 사용한다.
         # 아니면 질문 문장에서 코드로 찾은 found_department를 사용한다.
-        department = raw_department if raw_department in DEPARTMENTS else found_department
+        department = (
+            raw_department
+            if raw_department in DEPARTMENTS and value_appears_in_question(question, raw_department)
+            else found_department
+        )
 
         # LLM이 준 team이 실제 TEAMS 목록에 있으면 사용한다.
         # 아니면 질문 문장에서 코드로 찾은 found_team을 사용한다.
-        team = raw_team if raw_team in TEAMS else found_team
-
+        team = (
+            raw_team
+            if raw_team in TEAMS and value_appears_in_question(question, raw_team)
+            else found_team
+        )
         # LLM이 준 position이 실제 POSITIONS 목록에 있으면 사용한다.
         # 아니면 질문 문장에서 코드로 찾은 found_position을 사용한다.
-        position = raw_position if raw_position in POSITIONS else found_position
-
+        position = (
+            raw_position
+            if raw_position in POSITIONS and value_appears_in_question(question, raw_position)
+            else found_position
+        )
         # -------------------------
         # 3-4. filters 정규화
         # -------------------------
@@ -1037,13 +1065,27 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
         # 이름이 없으면 None
         employee_name, employee_id = normalize_employee_identity_fields(task)
 
+        # intent가 single_lookup이 아니어도,
+        # 질문에 사람 이름이 있으면 코드에서 다시 이름을 보정한다.
         if (
-            intent == "single_lookup"
-            and not bool(task.get("is_self", False))
+            not bool(task.get("is_self", False))
             and not employee_name
             and not employee_id
         ):
-            employee_name = extract_employee_name(question)
+            guessed_name = extract_employee_name(question)
+
+            if guessed_name:
+                employee_name = guessed_name
+
+        # 이름이 있고, 조건 필터가 없고, 특정 필드를 물어본 경우는
+        # condition_search가 아니라 특정 직원 단일 조회로 보정한다.
+        if (
+            employee_name
+            and intent == "condition_search"
+            and not filters
+            and safe_fields != ["employee"]
+        ):
+            intent = "single_lookup"
 
         # LLM이 "인사부", "마케팅부" 같은 조직명을
         # employee_name으로 잘못 넣는 경우가 있다.

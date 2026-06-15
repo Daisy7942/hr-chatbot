@@ -8,7 +8,37 @@ from app.services.question_service import (
 
 
 conversation_memory = {}
+current_session_employee_id = None
 
+def reset_memory_if_employee_changed(requester_employee_id: str) -> None:
+    """
+    요청자 employee_id가 이전 요청과 달라지면 세션 메모리를 전체 초기화한다.
+
+    예:
+    - 이전 요청자: EMP0070
+    - 현재 요청자: EMP0001
+    -> conversation_memory 전체 삭제
+
+    이유:
+    Swagger/FastAPI 테스트 중 employee_id를 바꿔가며 호출하면
+    이전 요청자의 대화 기억이 다음 요청에 섞일 수 있기 때문이다.
+    """
+
+    global current_session_employee_id
+
+    if not requester_employee_id:
+        return
+
+    requester_employee_id = requester_employee_id.strip().upper()
+
+    if current_session_employee_id is None:
+        current_session_employee_id = requester_employee_id
+        return
+
+    if current_session_employee_id != requester_employee_id:
+        conversation_memory.clear()
+        current_session_employee_id = requester_employee_id
+        print("[DEBUG] conversation memory reset by employee_id change:", requester_employee_id)
 
 NOT_TARGET_NAMES = {
     "계약직",
@@ -258,6 +288,11 @@ def update_memory_from_tasks(
 ) -> None:
     """
     분석된 task에서 다음 질문 해석에 필요한 대상 정보만 저장한다.
+
+    중요:
+    - 특정 직원 조회는 직원만 기억한다.
+    - 직원 조회에서 나온 department/team/position은 세션 조직 기억으로 저장하지 않는다.
+    - 조직 목록/조직 직원 조회일 때만 department/team/position을 기억한다.
     """
 
     if not requester_employee_id or not isinstance(tasks, list):
@@ -269,12 +304,15 @@ def update_memory_from_tasks(
         if not isinstance(task, dict):
             continue
 
+        intent = task.get("intent")
+
         if task.get("is_self"):
             memory["last_employee_id"] = requester_employee_id
             memory.pop("last_employee_name", None)
             memory.pop("last_department", None)
             memory.pop("last_team", None)
             memory.pop("last_position", None)
+            continue
 
         if task.get("employee_id"):
             memory["last_employee_id"] = str(task["employee_id"]).strip().upper()
@@ -282,6 +320,7 @@ def update_memory_from_tasks(
             memory.pop("last_department", None)
             memory.pop("last_team", None)
             memory.pop("last_position", None)
+            continue
 
         if task.get("employee_name"):
             memory["last_employee_name"] = task["employee_name"]
@@ -289,6 +328,10 @@ def update_memory_from_tasks(
             memory.pop("last_department", None)
             memory.pop("last_team", None)
             memory.pop("last_position", None)
+            continue
+
+        if intent not in {"employee_list", "condition_search", "category_list"}:
+            continue
 
         if task.get("department"):
             memory["last_department"] = task["department"]
@@ -302,3 +345,5 @@ def update_memory_from_tasks(
 
         if task.get("position"):
             memory["last_position"] = task["position"]
+            memory.pop("last_employee_name", None)
+            memory.pop("last_employee_id", None)
