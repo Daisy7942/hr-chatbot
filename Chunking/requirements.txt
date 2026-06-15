@@ -1,3 +1,0 @@
-python-dotenv
-langchain-text-splitters
-langchain-core
