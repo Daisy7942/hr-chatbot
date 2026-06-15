@@ -53,6 +53,69 @@ def is_self_question(question: str) -> bool:
     return any(keyword in question for keyword in self_keywords)
 
 
+def is_all_employee_query(question: str) -> bool:
+    """
+    질문이 특정 직원 1명이 아니라 전체 직원 집합을 대상으로 하는지 판단한다.
+    """
+
+    if not question:
+        return False
+
+    compact_question = compact_text(question)
+    all_employee_keywords = [
+        "모든직원",
+        "전체직원",
+        "전직원",
+        "직원전체",
+        "모든사원",
+        "전체사원",
+        "전사원",
+        "사원전체",
+        "직원들",
+        "사원들",
+    ]
+
+    return any(keyword in compact_question for keyword in all_employee_keywords)
+
+
+def is_employee_collection_query(question: str) -> bool:
+    """
+    질문이 특정 직원 1명이 아니라 직원 목록/집합을 대상으로 하는지 판단한다.
+    """
+
+    if not question:
+        return False
+
+    compact_question = compact_text(question)
+
+    if is_all_employee_query(question):
+        return True
+
+    collection_keywords = [
+        "직원보여줘",
+        "직원조회",
+        "직원검색",
+        "직원찾아",
+        "직원알려줘",
+        "직원목록",
+        "직원리스트",
+        "사원보여줘",
+        "사원조회",
+        "사원검색",
+        "사원찾아",
+        "사원알려줘",
+        "사원목록",
+        "사원리스트",
+        "정보있는직원",
+        "정보있는사원",
+        "정보가있는직원",
+        "정보가있는사원",
+        "정보있",
+    ]
+
+    return any(keyword in compact_question for keyword in collection_keywords)
+
+
 def extract_employee_name(question: str) -> str | None:
     """
     질문에서 직원 이름으로 보이는 한글 이름을 추출한다.
@@ -66,6 +129,9 @@ def extract_employee_name(question: str) -> str | None:
     """
 
     if not question:
+        return None
+
+    if is_employee_collection_query(question):
         return None
 
     cleaned = compact_text(question)
@@ -112,6 +178,10 @@ def extract_employee_name(question: str) -> str | None:
         "모두",
         "모든",
         "전부",
+        "정보있는",
+        "정보가있는",
+        "정보있",
+        "정보",
 
         # 필드명
         "사원번호",
@@ -206,6 +276,8 @@ def extract_employee_name(question: str) -> str | None:
             "주소",
             "연봉",
             "평가",
+            "정보",
+            "정보있",
         ]
     )
 

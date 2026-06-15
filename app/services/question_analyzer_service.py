@@ -5,6 +5,7 @@ import requests
 from app.services.question_service import (
     extract_employee_id,
     extract_employee_name,
+    is_employee_collection_query,
     is_self_question,
 )
 from app.services.query_policy_service import (
@@ -164,11 +165,12 @@ def build_fallback_analysis(question: str) -> dict:
     employee_id = extract_employee_id(question)
     employee_name = None if employee_id else extract_employee_name(question)
     is_self = is_self_question(question)
+    intent = "condition_search" if is_employee_collection_query(question) else "single_lookup"
 
     return {
         "tasks": [
             {
-                "intent": "single_lookup",
+                "intent": intent,
                 "target_fields": target_fields,
                 "employee_name": employee_name,
                 "employee_id": employee_id,
@@ -243,9 +245,28 @@ def find_org_alias(question: str) -> tuple[str, str] | None:
     """
 
     compact_question = compact_text(question)
+    non_org_phrases = [
+        "인사고과",
+        "인사평가",
+    ]
 
     for rule in ORG_ALIAS_RULES:
-        if any(keyword in compact_question for keyword in rule["keywords"]):
+        matched_keyword = next(
+            (
+                keyword
+                for keyword in sorted(rule["keywords"], key=len, reverse=True)
+                if keyword in compact_question
+            ),
+            None,
+        )
+
+        if not matched_keyword:
+            continue
+
+        if any(phrase in compact_question for phrase in non_org_phrases):
+            if matched_keyword == "인사":
+                continue
+
             return rule["field"], rule["value"]
 
     return None
@@ -402,13 +423,20 @@ def normalize_target_fields_by_question(
 
     # 사용자가 입력한 주민등록번호(rrn)를 물어본 것을 LLM이 employee_id로 잘못 분석하는 경우 rrnㅇ로 보정한다.
     if "주민등록번호" in compact_question or "주민번호" in compact_question:
-        return [
-            # field가 employee_id인 경우 rrn으로 바꾼다. 그 외 필드는 그대로 둔다.
-            "rrn" if field == "employee_id" else field
+        normalized_fields = []
 
-            # target_fields 안의 필드를 하나씩 확인한다.
-            for field in target_fields
-        ]
+        for field in target_fields:
+            # LLM이 주민번호 질문을 사번/이름/unknown으로 잘못 잡는 경우 rrn으로 보정한다.
+            if field in {"employee_id", "employee_name", "unknown"}:
+                field = "rrn"
+
+            if field not in normalized_fields:
+                normalized_fields.append(field)
+
+        if "rrn" not in normalized_fields:
+            normalized_fields.insert(0, "rrn")
+
+        return normalized_fields
 
     # 주민등록번호 관련 질문이 아니면
     # 기존 target_fields를 그대로 반환한다.
@@ -879,6 +907,7 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
         keyword in compact_question
         for keyword in count_keywords
     )
+    requested_employee_collection = is_employee_collection_query(question)
 
     # 최종적으로 정리된 task들을 담을 리스트
     normalized_tasks = []
@@ -1075,6 +1104,12 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
             intent = "employee_count"
             safe_fields = ["employee"]
 
+        if requested_employee_collection:
+            intent = "condition_search"
+
+            if safe_fields == ["unknown"]:
+                safe_fields = ["employee"]
+
         # -------------------------
         # 5. 직원 식별 정보 정규화
         # -------------------------
@@ -1086,10 +1121,15 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
         # 이름이 없으면 None
         employee_name, employee_id = normalize_employee_identity_fields(task)
 
+        if requested_employee_collection:
+            employee_name = None
+            employee_id = None
+
         # intent가 single_lookup이 아니어도,
         # 질문에 사람 이름이 있으면 코드에서 다시 이름을 보정한다.
         if (
-            not bool(task.get("is_self", False))
+            not requested_employee_collection
+            and not bool(task.get("is_self", False))
             and not employee_name
             and not employee_id
         ):
@@ -1102,6 +1142,7 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
         # condition_search가 아니라 특정 직원 단일 조회로 보정한다.
         if (
             employee_name
+            and not requested_employee_collection
             and intent == "condition_search"
             and not filters
             and safe_fields != ["employee"]

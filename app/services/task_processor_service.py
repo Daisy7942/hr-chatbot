@@ -6,6 +6,7 @@ from app.services.question_service import (
     compact_text,
     extract_employee_id,
     extract_employee_name,
+    is_employee_collection_query,
     is_self_question,
 )
 from app.services.hybrid_search_service import (
@@ -664,6 +665,15 @@ def process_task(
     task_start_time = time.perf_counter()
     #task에서 의도 출력
     intent = task.get("intent", "unknown")
+    requested_employee_collection = is_employee_collection_query(original_question)
+
+    if requested_employee_collection:
+        task["employee_name"] = None
+        task["employee_id"] = None
+
+        if intent == "single_lookup":
+            intent = "condition_search"
+
     print("[TIME] process_task start:", intent)
 
     # LLM이 추출한 조직 값은 반드시 코드의 조직 정책 목록으로 다시 검증한다.
@@ -743,7 +753,11 @@ def process_task(
             },
         }
 
-    if intent == "single_lookup" and not bool(task.get("is_self", False)):
+    if (
+        intent == "single_lookup"
+        and not requested_employee_collection
+        and not bool(task.get("is_self", False))
+    ):
         if not task.get("employee_name") and not task.get("employee_id"):
             guessed_name = extract_employee_name(original_question)
 
@@ -752,6 +766,7 @@ def process_task(
 
     if (
         intent == "condition_search"
+        and not requested_employee_collection
         and not filters
         and not task.get("employee_name")
         and not task.get("employee_id")
@@ -778,7 +793,7 @@ def process_task(
     is_self = bool(task.get("is_self", False))
 
     # 단일 직원 조회에서 LLM이 이름을 놓친 경우에만 정규식 기반 이름 추출로 보완한다.
-    if intent == "single_lookup" and not is_self:
+    if intent == "single_lookup" and not requested_employee_collection and not is_self:
         if not task.get("employee_name") and not task.get("employee_id"):
             guessed_name = extract_employee_name(original_question)
 
@@ -1048,6 +1063,11 @@ def process_task(
 
         if not search_hits:
             answer = NO_SEARCH_RESULT_MESSAGE
+        elif requested_employee_collection:
+            answer = format_allowed_hits_answer(
+                hits=search_hits,
+                allowed_fields=allowed_fields,
+            )
         elif intent in {"condition_search", "employee_list"} and filters:
             answer = format_allowed_hits_answer(
                 hits=search_hits,
