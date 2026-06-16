@@ -86,15 +86,15 @@ FIELD_RULES = {
     "retirement_type": {
         "label": "퇴직구분",
         "doc_type": "basic",
-        "index_level": 1,
-        "required_level": 1,
+        "index_level": 3,
+        "required_level": 3,
         "embedding_label": "퇴직구분",
     },
     "retirement_date": {
         "label": "퇴직일자",
         "doc_type": "basic",
-        "index_level": 1,
-        "required_level": 1,
+        "index_level": 3,
+        "required_level": 3,
         "embedding_label": "퇴직일자",
     },
     "email": {
@@ -353,13 +353,6 @@ FIELD_RULES = {
         "required_level": 2,
         "embedding_label": "TOEIC점수",
     },
-    "certificate_allowance": {
-        "label": "자격증수당여부",
-        "doc_type": "performance",
-        "index_level": 2,
-        "required_level": 2,
-        "embedding_label": "자격증수당여부",
-    },
     "award_history": {
         "label": "포상이력",
         "doc_type": "performance",
@@ -384,6 +377,13 @@ FIELD_RULES = {
         "index_level": 3,
         "required_level": 3,
         "embedding_label": "징계사유",
+    },
+    "certificate_allowance": {
+        "label": "자격증수당여부",
+        "doc_type": "performance",
+        "index_level": 3,
+        "required_level": 3,
+        "embedding_label": "자격증수당여부",
     },
 }
 

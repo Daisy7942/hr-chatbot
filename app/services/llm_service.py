@@ -1,8 +1,134 @@
 import requests
 import time
+import os
+from dotenv import load_dotenv
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "gemma3:4b"
+load_dotenv()
+
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").lower()
+
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:4b")
+
+OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+
+def get_active_llm_model() -> str:
+    if LLM_PROVIDER == "openai":
+        return OPENAI_MODEL
+
+    return OLLAMA_MODEL
+
+
+def get_active_llm_label() -> str:
+    return f"{LLM_PROVIDER}:{get_active_llm_model()}"
+
+
+def call_openai_chat_completion(
+    prompt: str,
+    temperature: float = 0.1,
+    max_tokens: int | None = None,
+    timeout: int = 60,
+) -> str:
+    """
+    OpenAI GPT API를 호출해서 텍스트 응답을 반환한다.
+    """
+
+    if not OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY가 설정되어 있지 않습니다.")
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        "temperature": temperature,
+    }
+
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+
+    response = requests.post(
+        OPENAI_API_URL,
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+
+    result = response.json()
+    choices = result.get("choices", [])
+
+    if not choices:
+        return ""
+
+    return choices[0].get("message", {}).get("content", "").strip()
+
+
+def call_ollama_completion(
+    prompt: str,
+    temperature: float = 0.1,
+    max_tokens: int | None = None,
+    timeout: int = 60,
+) -> str:
+    """
+    Ollama Gemma 모델을 호출해서 텍스트 응답을 반환한다.
+    """
+
+    options = {
+        "temperature": temperature,
+    }
+
+    if max_tokens is not None:
+        options["num_predict"] = max_tokens
+
+    response = requests.post(
+        OLLAMA_URL,
+        json={
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "options": options,
+        },
+        timeout=timeout,
+    )
+    response.raise_for_status()
+
+    return response.json().get("response", "").strip()
+
+
+def call_llm_completion(
+    prompt: str,
+    temperature: float = 0.1,
+    max_tokens: int | None = None,
+    timeout: int = 60,
+) -> str:
+    """
+    운영 기본값은 Ollama/Gemma이고, 비교가 필요할 때만 LLM_PROVIDER=openai로 GPT를 사용한다.
+    """
+
+    if LLM_PROVIDER == "openai":
+        return call_openai_chat_completion(
+            prompt=prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
+
+    return call_ollama_completion(
+        prompt=prompt,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        timeout=timeout,
+    )
 
 
 def build_rag_prompt(question: str, context: str) -> str:
@@ -137,36 +263,25 @@ def build_rag_prompt(question: str, context: str) -> str:
 
 def generate_answer(question: str, context: str) -> str:
     """
-    Ollama gemma3:4b 모델을 호출하여
-    Context 기반 답변을 생성한다.
+    설정된 LLM Provider로 Context 기반 답변을 생성한다.
     """
 
-    start_time = time.perf_counter()
+    # start_time = time.perf_counter()
     prompt = build_rag_prompt(question, context)
-    print("[TIME] build_rag_prompt:", f"{time.perf_counter() - start_time:.3f}s")
+    # print("[TIME] build_rag_prompt:", f"{time.perf_counter() - start_time:.3f}s")
 
-    request_start_time = time.perf_counter()
-    response = requests.post(
-        OLLAMA_URL,
-        json={
-            "model": MODEL_NAME,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": 0.1
-            }
-        },
+    # request_start_time = time.perf_counter()
+    answer = call_llm_completion(
+        prompt=prompt,
+        temperature=0.1,
         timeout=60,
     )
-    print(
-        "[TIME] generate_answer ollama:",
-        f"{time.perf_counter() - request_start_time:.3f}s",
-    )
 
-    response.raise_for_status()
+    # print(
+    #     f"[TIME] generate_answer {LLM_PROVIDER}:",
+    #     f"{time.perf_counter() - request_start_time:.3f}s",
+    # )
 
-    result = response.json()
+    # print("[TIME] generate_answer total:", f"{time.perf_counter() - start_time:.3f}s")
 
-    print("[TIME] generate_answer total:", f"{time.perf_counter() - start_time:.3f}s")
-
-    return result.get("response", "").strip()
+    return answer

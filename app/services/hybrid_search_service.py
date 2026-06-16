@@ -174,25 +174,30 @@ embedding_model = AutoModel.from_pretrained(MODEL_NAME)
 def extract_embedding_text_field(embedding_text: str, field_name: str) -> str:
     """
     embedding_text의 "필드명: 값" 형태에서 값을 꺼낸다.
-    예: "팀: 브랜드팀 직책: 팀원"에서 팀 값을 꺼내면 "브랜드팀"
+    예:
+    주소: 서울시 마포구 합정동
+    퇴직일자: 2024-10-17
+
+    field_name이 "퇴직일자"이면 "2024-10-17"을 반환한다.
     """
 
-    if not embedding_text:
-        return ""
-    #  r 정규표현식 , f f-string , 
-    # (?:^|\s) 필드명 앞에 공백이나 문장 시작이 올 수 있도록, 
-    # \s*: 필드명과 값 사이의 콜론과 공백을 허용,
-    # (.*?) 실제로 꺼내고 싶은 값(?가 붙어 있어서 너무 많이 가져오지 말고 필요한 만큼만),
-    # (?=\s+[가-힣A-Za-z0-9_]+\s*:|$) 다음 필드명이 나오기 전까지만 가져와라.
-    pattern = rf"(?:^|\s){re.escape(field_name)}\s*:\s*(.*?)(?=\s+[가-힣A-Za-z0-9_]+\s*:|$)"
-    match = re.search(pattern, embedding_text)
-    # re.search(찾을규칙, 찾을대상)
-
-    if not match:
+    if not embedding_text or not field_name:
         return ""
 
-    return match.group(1).strip()
-    # 괄호로 잡은 첫번째 값 꺼내기 + 양쪽 공백 제거
+    for line in embedding_text.splitlines():
+        line = line.strip()
+
+        if not line.startswith(field_name):
+            continue
+
+        rest = line[len(field_name):].lstrip()
+
+        if not rest.startswith(":"):
+            continue
+
+        return rest[1:].strip()
+
+    return ""
 
  
 def build_list_summary(search_hits, question: str) -> str | None:
@@ -218,25 +223,19 @@ def build_list_summary(search_hits, question: str) -> str | None:
     list_targets = {
         "부서": {
             "label": "부서",
-            "getter": lambda source, embedding_text: source.get("department", ""),
+            "field_key": "department",
         },
         "팀": {
             "label": "팀",
-            "getter": lambda source, embedding_text: extract_embedding_text_field(
-                embedding_text,
-                "팀",
-            ),
+            "field_key": "team",
         },
         "직급": {
             "label": "직급",
-            "getter": lambda source, embedding_text: source.get("job_grade", ""),
+            "field_key": "job_grade",
         },
         "직책": {
             "label": "직책",
-            "getter": lambda source, embedding_text: extract_embedding_text_field(
-                embedding_text,
-                "직책",
-            ),
+            "field_key": "position",
         },
     }
 
@@ -250,7 +249,11 @@ def build_list_summary(search_hits, question: str) -> str | None:
             source = hit.get("_source", {})
             embedding_text = source.get("embedding_text", "")
 
-            value = config["getter"](source, embedding_text)
+            value = get_allowed_field_value(
+                source=source,
+                embedding_text=embedding_text,
+                field_key=config["field_key"],
+            )
 
             if value:
                 values.add(value)
@@ -356,16 +359,17 @@ def build_full_list_answer(question: str, permission_level: int) -> str | None:
         source = hit.get("_source", {})
         embedding_text = source.get("embedding_text", "")
 
-        if target == "부서":
-            value = source.get("department", "")
-        elif target == "직급":
-            value = source.get("job_grade", "")
-        elif target == "팀":
-            value = extract_embedding_text_field(embedding_text, "팀")
-        elif target == "직책":
-            value = extract_embedding_text_field(embedding_text, "직책")
-        else:
-            value = ""
+        field_key_by_label = {
+            "부서": "department",
+            "직급": "job_grade",
+            "팀": "team",
+            "직책": "position",
+        }
+        value = get_allowed_field_value(
+            source=source,
+            embedding_text=embedding_text,
+            field_key=field_key_by_label.get(target, ""),
+        )
 
         if value:
             value = value.strip()
@@ -418,12 +422,6 @@ def get_allowed_field_value(source: dict, embedding_text: str, field_key: str):
 
     if source_field:
         return source.get(source_field, "")
-
-    # FIELD_RULES에 source_field가 없어도,
-    # 실제 _source에 field_key 이름으로 값이 있으면 먼저 사용한다.
-    # 예: source["hire_date"]
-    if field_key in source:
-        return source.get(field_key, "")
 
     # embedding_text 안에 들어있는 필드
     embedding_label = rule.get("embedding_label")
@@ -662,6 +660,138 @@ def select_search_indices(question: str, permission_level: int) -> list[str]:
     return selected_indices or indices
 
 
+def build_field_exists_clause(rule: dict) -> dict | None:
+    """
+    FIELD_RULES의 source_field 또는 embedding_label 기준으로 값이 실제 입력된 문서를 찾는다.
+    "미입력"은 값이 없는 상태로 본다.
+    """
+
+    source_field = rule.get("source_field")
+    embedding_label = rule.get("embedding_label")
+
+    if source_field:
+        return {
+            "bool": {
+                "must": [
+                    {"exists": {"field": source_field}},
+                ],
+                "must_not": [
+                    {"term": {source_field: "미입력"}},
+                ],
+            }
+        }
+
+    if embedding_label:
+        return {
+            "bool": {
+                "must": [
+                    {
+                        "match_phrase": {
+                            "embedding_text": f"{embedding_label}:"
+                        }
+                    }
+                ],
+                "must_not": [
+                    {
+                        "match_phrase": {
+                            "embedding_text": f"{embedding_label}: 미입력"
+                        }
+                    }
+                ],
+            }
+        }
+
+    return None
+
+
+def build_opensearch_filter_clauses(filters: list[dict] | None) -> list[dict]:
+    """
+    task filters를 OpenSearch bool filter 조건으로 바꾼다.
+
+    예:
+    {"field": "retirement_date", "op": "contains", "value": "2024"}
+    -> embedding_text에 "퇴직일자: 2024"가 포함된 문서 검색
+    """
+
+    if not filters:
+        return []
+
+    clauses = []
+
+    for filter_item in filters:
+        if not isinstance(filter_item, dict):
+            continue
+
+        field = filter_item.get("field")
+        op = filter_item.get("op", "eq")
+        value = filter_item.get("value")
+
+        if field not in FIELD_RULES:
+            continue
+
+        if value is None or value == "":
+            continue
+
+        if isinstance(value, str) and value.strip().upper() == "NULL":
+            continue
+
+        rule = FIELD_RULES[field]
+
+        if op == "exists":
+            clause = build_field_exists_clause(rule)
+
+            if clause:
+                clauses.append(clause)
+
+            continue
+
+        # 우선 eq / contains만 OpenSearch 검색 조건으로 사용한다.
+        # gte, lte, between 같은 숫자 비교는 기존 filter_hits_by_filters에서 후처리한다.
+        if op not in {"eq", "contains"}:
+            continue
+
+        source_field = rule.get("source_field")
+        embedding_label = rule.get("embedding_label")
+
+        if source_field:
+            clauses.append(
+                {
+                    "match_phrase": {
+                        source_field: str(value)
+                    }
+                }
+            )
+            continue
+
+        if embedding_label:
+            clauses.append(
+                {
+                    "bool": {
+                        "should": [
+                            {
+                                "match_phrase": {
+                                    "embedding_text": f"{embedding_label}: {value}"
+                                }
+                            },
+                            {
+                                "match_phrase": {
+                                    "embedding_text": str(value)
+                                }
+                            },
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                }
+            )
+
+    return clauses
+
+
+
+
+
+
+
 # =========================
 # BM25 검색 함수
 # =========================
@@ -674,6 +804,7 @@ def search_bm25(
     extract_name=True,
     size=5,
     indices=None,
+    filters=None,
 ):
     """
     embedding_text 필드를 대상으로 BM25 기반 키워드 검색을 수행한다.
@@ -684,7 +815,7 @@ def search_bm25(
     """
 
     indices = indices or select_search_indices(question, permission_level)
-
+    filter_clauses = build_opensearch_filter_clauses(filters)
     if not indices:
         print("접근 가능한 인덱스가 없습니다.")
         return []
@@ -700,7 +831,8 @@ def search_bm25(
                         {"match_all": {}}
                     ],
                     "filter": [
-                        {"term": {"employee_id": employee_id}}
+                        {"term": {"employee_id": employee_id}},
+                        *filter_clauses,
                     ],
                 }
             },
@@ -717,7 +849,7 @@ def search_bm25(
                     "should": [
                         {"match": {"embedding_text": question}}
                     ],
-                    "filter": [],
+                    "filter": filter_clauses,
                     "minimum_should_match": 1,
                 }
             },
@@ -762,9 +894,15 @@ def search_bm25(
                 {"match_phrase": {"embedding_text": "팀:"}}
             )
 
+        has_department_filter = any(
+            filter_item.get("field") == "department"
+            for filter_item in (filters or [])
+            if isinstance(filter_item, dict)
+        )
+
         # 부서명이 직접 들어온 경우 department 필터 추가
         for department in DEPARTMENTS:
-            if department in question:
+            if department in question and not has_department_filter:
                 query["query"]["bool"]["filter"].append(
                     {"match_phrase": {"department": department}}
                 )
@@ -838,6 +976,8 @@ def cosine_similarity(vec1, vec2):
     norm_a = sum(a * a for a in vec1) ** 0.5
     norm_b = sum(b * b for b in vec2) ** 0.5
     return dot / (norm_a * norm_b + 1e-9)
+
+
 
 
 def search_vector(
@@ -1004,9 +1144,30 @@ def merge_rrf(bm25_hits, vector_hits, k=60, size=5):
         reverse=True,
     )
 
-    # 상위 size개만 반환한다.
-    return [item["hit"] for item in sorted_results[:size]]
+    results = []
 
+    for idx, item in enumerate(sorted_results[:size], start=1):
+        hit = item["hit"]
+        source = hit.get("_source", {})
+
+        # print(
+        #     "[DEBUG] RRF hit",
+        #     idx,
+        #     {
+        #         "index": hit.get("_index"),
+        #         "id": hit.get("_id"),
+        #         "rrf_score": item.get("rrf_score"),
+        #         "original_score": hit.get("_score"),
+        #         "employee_id": source.get("employee_id"),
+        #         "employee_name": source.get("employee_name"),
+        #         "department": source.get("department"),
+        #         "source": source.get("source"),
+        #     },
+        # )
+
+        results.append(hit)
+
+    return results
 
 # =========================
 # 조직/부서/팀 직접 검색 함수
@@ -1095,23 +1256,13 @@ def get_category_values(field_key: str, permission_level: int) -> list[str]:
     hits = response["hits"]["hits"]
     values = set()
 
-    embedding_labels = {
-        "team": FIELD_RULES["team"].get("embedding_label"),
-        "position": FIELD_RULES["position"].get("embedding_label"),
-    }
-
     for hit in hits:
         source = hit.get("_source", {})
-
-        if field_key == "department":
-            value = source.get("department", "")
-        elif field_key == "job_grade":
-            value = source.get("job_grade", "")
-        else:
-            value = extract_embedding_text_field(
-                source.get("embedding_text", ""),
-                embedding_labels.get(field_key, ""),
-            )
+        value = get_allowed_field_value(
+            source=source,
+            embedding_text=source.get("embedding_text", ""),
+            field_key=field_key,
+        )
 
         if value:
             values.add(value.strip())
@@ -1256,6 +1407,131 @@ def search_employees_by_conditions(
 
     return hits
 
+
+def build_filter_search_clause(filter_item: dict) -> dict | None:
+    """
+    task filter를 OpenSearch 검색 조건으로 바꾼다.
+
+    최종 검증은 task_processor_service.py의 filter_hits_by_filters에서 한 번 더 한다.
+    여기서는 후보군을 정확하게 줄이는 역할만 한다.
+    """
+
+    field = filter_item.get("field")
+    op = filter_item.get("op", "eq")
+    value = filter_item.get("value")
+
+    if field not in FIELD_RULES or value is None or value == "":
+        return None
+
+    if isinstance(value, str) and value.strip().upper() == "NULL":
+        return None
+
+    rule = FIELD_RULES[field]
+
+    if op == "exists":
+        return build_field_exists_clause(rule)
+
+    # 숫자 비교는 OpenSearch에서 직접 처리하지 않고,
+    # 후보 조회 후 filter_hits_by_filters에서 검증한다.
+    if op not in {"eq", "contains"}:
+        return None
+
+    source_field = rule.get("source_field")
+    if source_field:
+        return {
+            "match_phrase": {
+                source_field: str(value)
+            }
+        }
+
+    # embedding_text 안에 있는 필드는 OpenSearch 라벨 매칭에 의존하지 않는다.
+    # 후보는 관련 인덱스에서 넓게 가져오고, 실제 값 비교는 get_allowed_field_value()로 한다.
+    if rule.get("embedding_label"):
+        return None
+
+    return None
+
+
+def search_employees_by_filter_conditions(
+    indices: list[str],
+    filters: list[dict],
+    size: int = 10000,
+) -> list[dict]:
+    """
+    입사일/퇴직일자/계약형태 같은 조건 검색은
+    hybrid 검색 전에 OpenSearch filter로 후보를 줄인다.
+    """
+
+    if not indices:
+        return []
+
+    filter_conditions = []
+
+    for filter_item in filters:
+        clause = build_filter_search_clause(filter_item)
+
+        if clause:
+            filter_conditions.append(clause)
+
+    query = {
+        "query": (
+            {
+                "bool": {
+                    "filter": filter_conditions
+                }
+            }
+            if filter_conditions
+            else {
+                "match_all": {}
+            }
+        ),
+        "size": size,
+    }
+
+    print("[DEBUG] 필터 조건 검색 indices:", indices)
+    print("[DEBUG] 필터 조건 검색 query:", query)
+
+    response = client.search(
+        index=indices,
+        body=query,
+    )
+
+    hits = response["hits"]["hits"]
+
+    print("[DEBUG] 필터 조건 검색 결과 수:", len(hits))
+
+    return hits
+
+
+def search_hits_by_employee_ids(
+    indices: list[str],
+    employee_ids: list[str],
+    size: int = 10000,
+) -> list[dict]:
+    """
+    조건을 만족한 employee_id들의 관련 문서를 다시 가져온다.
+    조건 필드와 정렬/답변 필드가 서로 다른 인덱스에 있을 때 사용한다.
+    """
+
+    if not indices or not employee_ids:
+        return []
+
+    query = {
+        "size": size,
+        "query": {
+            "terms": {
+                "employee_id": employee_ids
+            }
+        },
+    }
+
+    response = client.search(
+        index=indices,
+        body=query,
+    )
+
+    return response["hits"]["hits"]
+
 def count_employees_by_conditions(
     permission_level: int,
     department: str | None = None,
@@ -1359,14 +1635,32 @@ def format_employee_list_answer(hits) -> str:
 
     for hit in hits:
         source = hit.get("_source", {})
-
-        employee_name = source.get("employee_name", "이름 없음")
-        employee_id = source.get("employee_id", "사번 없음")
-        department = source.get("department", "부서 없음")
         embedding_text = source.get("embedding_text", "")
-        team = extract_embedding_text_field(embedding_text, "팀") or "팀 없음"
-        position = extract_embedding_text_field(embedding_text, "직책") or "직책 없음"
-        job_grade = source.get("job_grade", "직급 없음")
+
+        employee_name = (
+            get_allowed_field_value(source, embedding_text, "employee_name")
+            or "이름 없음"
+        )
+        employee_id = (
+            get_allowed_field_value(source, embedding_text, "employee_id")
+            or "사번 없음"
+        )
+        department = (
+            get_allowed_field_value(source, embedding_text, "department")
+            or "부서 없음"
+        )
+        team = (
+            get_allowed_field_value(source, embedding_text, "team")
+            or "팀 없음"
+        )
+        position = (
+            get_allowed_field_value(source, embedding_text, "position")
+            or "직책 없음"
+        )
+        job_grade = (
+            get_allowed_field_value(source, embedding_text, "job_grade")
+            or "직급 없음"
+        )
         lines.append(
             f"- {employee_name} ({employee_id}) / {department} / {team} / {position} / {job_grade}"
         )
@@ -1377,9 +1671,9 @@ def make_sources(hits, allowed_fields=None) -> list[dict]:
     """
     검색 결과를 API sources 형태로 변환한다.
 
-    보안 원칙:
+    원칙:
     - allowed_fields에 포함된 필드만 sources에 넣는다.
-    - embedding_text 원문은 절대 응답하지 않는다.
+    - 디버깅을 위해 검색된 문서의 embedding_text 원문도 함께 보여준다.
     """
 
     allowed_fields = set(allowed_fields or [])
@@ -1393,6 +1687,7 @@ def make_sources(hits, allowed_fields=None) -> list[dict]:
             "index": hit["_index"],
             "_id": hit["_id"],
             "score": hit.get("_score"),
+            "embedding_text": embedding_text,
         }
 
         if "employee" in allowed_fields:
@@ -1484,29 +1779,30 @@ def search_hybrid(
     extract_name=True,
     size=20,
     indices=None,
+    filters=None,
 ):
     """
     BM25 검색과 벡터 검색을 각각 수행한 뒤,
     RRF 방식으로 결과를 병합한다.
     """
 
-    start_time = time.perf_counter()
+    # start_time = time.perf_counter()
 
     if employee_id:
         employee_id = employee_id.strip().upper()
 
-    vector_create_start_time = time.perf_counter()
+    # vector_create_start_time = time.perf_counter()
     question_vector = create_question_vector(question)
-    print(
-        "[TIME] create_question_vector:",
-        f"{time.perf_counter() - vector_create_start_time:.3f}s",
-    )
+    # print(
+    #     "[TIME] create_question_vector:",
+    #     f"{time.perf_counter() - vector_create_start_time:.3f}s",
+    # )
 
     # 바깥에서 indices를 넘기면 그 인덱스만 검색한다.
     # 안 넘기면 기존 방식대로 질문과 권한 기준으로 인덱스를 선택한다.
     indices = indices or select_search_indices(question, permission_level)
 
-    bm25_start_time = time.perf_counter()
+    # bm25_start_time = time.perf_counter()
     bm25_hits = search_bm25(
         question=question,
         permission_level=permission_level,
@@ -1515,13 +1811,18 @@ def search_hybrid(
         extract_name=extract_name,
         size=size,
         indices=indices,
+        filters=filters,
     )
-    print(
-        "[TIME] search_bm25:",
-        f"{time.perf_counter() - bm25_start_time:.3f}s",
-    )
+    # print(
+    #     "[TIME] search_bm25:",
+    #     f"{time.perf_counter() - bm25_start_time:.3f}s",
+    # )
 
-    vector_start_time = time.perf_counter()
+    # print("[DEBUG] BM25 hits count:", len(bm25_hits))
+
+
+
+    # vector_start_time = time.perf_counter()
     vector_hits = search_vector(
         question=question,
         question_vector=question_vector,
@@ -1532,25 +1833,27 @@ def search_hybrid(
         size=size,
         indices=indices,
     )
-    print(
-        "[TIME] search_vector:",
-        f"{time.perf_counter() - vector_start_time:.3f}s",
-    )
+    # print(
+    #     "[TIME] search_vector:",
+    #     f"{time.perf_counter() - vector_start_time:.3f}s",
+    # )
 
-    print("[DEBUG] Vector hits count:", len(vector_hits))
+    # print("[DEBUG] Vector hits count:", len(vector_hits))
 
-    rrf_start_time = time.perf_counter()
+ 
+
+    # rrf_start_time = time.perf_counter()
     hybrid_hits = merge_rrf(
         bm25_hits=bm25_hits,
         vector_hits=vector_hits,
         size=size,
     )
-    print(
-        "[TIME] merge_rrf:",
-        f"{time.perf_counter() - rrf_start_time:.3f}s",
-    )
+    # print(
+    #     "[TIME] merge_rrf:",
+    #     f"{time.perf_counter() - rrf_start_time:.3f}s",
+    # )
 
-    print("[DEBUG] Hybrid RRF hits count:", len(hybrid_hits))
-    print("[TIME] search_hybrid total:", f"{time.perf_counter() - start_time:.3f}s")
+    # print("[DEBUG] Hybrid RRF hits count:", len(hybrid_hits))
+    # print("[TIME] search_hybrid total:", f"{time.perf_counter() - start_time:.3f}s")
 
     return hybrid_hits

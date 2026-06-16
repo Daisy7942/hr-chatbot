@@ -1,5 +1,5 @@
 import re
-
+from app.services.query_policy_service import FIELD_RULES
 from app.services.org_policy_service import (
     DEPARTMENTS,
     TEAMS,
@@ -111,9 +111,53 @@ def is_employee_collection_query(question: str) -> bool:
         "정보가있는직원",
         "정보가있는사원",
         "정보있",
+        "입사한사람",
+        "퇴사한사람",
+        "퇴직한사람",
+        "입사한직원",
+        "퇴사한직원",
+        "퇴직한직원",
+        "입사자",
+        "퇴사자",
+        "퇴직자",
+        "사람들",
+        "사람",
     ]
+    date_condition_keywords = ["입사", "퇴사", "퇴직"]
+    collection_nouns = ["사람", "직원", "사원", "대상자"]
+
+    if (
+        any(keyword in compact_question for keyword in date_condition_keywords)
+        and any(noun in compact_question for noun in collection_nouns)
+    ):
+        return True
 
     return any(keyword in compact_question for keyword in collection_keywords)
+
+def get_field_label_words() -> list[str]:
+    """
+    FIELD_RULES에 등록된 사용자 표시용 필드명을 이름 제거 목록으로 만든다.
+
+    예:
+    FIELD_RULES["retirement_date"]["label"] = "퇴직일자"
+    FIELD_RULES["retirement_date"]["embedding_label"] = "퇴직일자"
+
+    그러면 질문에서 "퇴직일자"를 직원 이름으로 오해하지 않게 제거할 수 있다.
+    """
+
+    words = []
+
+    for rule in FIELD_RULES.values():
+        label = rule.get("label")
+        embedding_label = rule.get("embedding_label")
+
+        if label:
+            words.append(label)
+
+        if embedding_label:
+            words.append(embedding_label)
+
+    return words
 
 
 def extract_employee_name(question: str) -> str | None:
@@ -125,17 +169,43 @@ def extract_employee_name(question: str) -> str | None:
     - 오민호 이메일 알려줘 -> 오민호
 
     주의:
-    - 이메일, 부서, 직책, 팀장 같은 필드명/조건명을 이름으로 오해하면 안 된다.
+    - 직원 목록/집합 질문에서는 이름을 추출하지 않는다.
+      예: 2024년 퇴사한 사람 알려줘 -> None
+    - 부서명, 팀명, 직책명, 필드명을 이름으로 오해하지 않는다.
     """
 
     if not question:
         return None
 
+    # "퇴사한 사람", "입사한 직원" 같은 질문은 특정 1명 조회가 아니다.
+    # 이런 경우 이름을 억지로 뽑으면 "년퇴사한" 같은 오탐이 생긴다.
     if is_employee_collection_query(question):
         return None
 
     cleaned = compact_text(question)
 
+    # 연도 표현 제거
+    # 예: "2024년퇴사한사람" -> "퇴사한사람"
+    cleaned = re.sub(r"(19|20)\d{2}년?(도)?(에)?", "", cleaned)
+
+    # 조건 표현이 남아 있으면 이름이 아니다.
+    # 예: "퇴사한", "입사자", "계약직" 같은 말은 직원명이 아님
+    not_name_fragments = [
+        "입사한",
+        "퇴사한",
+        "퇴직한",
+        "입사자",
+        "퇴사자",
+        "퇴직자",
+        "계약직",
+        "정규직",
+    ]
+
+    if any(word in cleaned for word in not_name_fragments):
+        return None
+
+    # 요청/연결/목록 표현
+    # 필드명은 아래에서 FIELD_RULES 기준으로 자동 추가한다.
     remove_words = [
         # 요청 표현
         "알려줘",
@@ -166,6 +236,8 @@ def extract_employee_name(question: str) -> str | None:
         # 목록/집합 표현
         "직원들",
         "직원",
+        "사원들",
+        "사원",
         "팀원들",
         "팀원",
         "구성원",
@@ -183,54 +255,21 @@ def extract_employee_name(question: str) -> str | None:
         "정보있",
         "정보",
 
-        # 필드명
-        "사원번호",
+        # 자주 쓰는 필드 별칭
+        # FIELD_RULES에 없는 말만 최소한으로 둔다.
         "사번",
-        "이름",
-        "회사명",
-        "사업장위치",
-        "부서",
-        "팀",
-        "직급",
-        "직책",
-        "이메일",
         "메일",
-        "전화번호",
         "연락처",
-        "주소",
-        "입사일",
-        "근속기간",
-        "생년월일",
-        "주민등록번호",
         "주민번호",
-        "학력",
-        "출신대학",
-        "학점",
-        "채용경로",
-        "계약형태",
-        "이전직장명",
-        "이전최종직급",
-        "이전담당업무",
-        "연봉",
         "급여",
-        "급여은행",
         "은행",
-        "계좌번호",
         "계좌",
-        "잔업시간",
-        "미사용휴가일수",
-        "성과점수",
         "성과",
         "평가",
-        "인사평가",
         "고과",
         "인사고과",
-        "자격증",
         "토익",
         "TOEIC",
-        "포상이력",
-        "징계이력",
-        "징계사유",
 
         # 본인 표현
         "내",
@@ -243,19 +282,28 @@ def extract_employee_name(question: str) -> str | None:
         "우리",
     ]
 
+    # FIELD_RULES에 등록된 필드 라벨을 자동으로 제거 목록에 추가한다.
+    # 예: 사원번호, 이름, 부서, 입사일, 퇴직일자, 주소 등
+    remove_words.extend(get_field_label_words())
+
     # 실제 조직명/직책명은 이름이 아니다.
     remove_words.extend(DEPARTMENTS)
     remove_words.extend(TEAMS)
     remove_words.extend(POSITIONS)
+
+    # 중복 제거
+    remove_words = list(set(remove_words))
 
     # 긴 단어부터 제거해야 한다.
     # 예: "팀장"보다 "팀"을 먼저 지우면 "장"만 남을 수 있다.
     for word in sorted(remove_words, key=len, reverse=True):
         cleaned = cleaned.replace(word, "")
 
-    # 조사는 전체 replace 하지 말고 끝부분만 제거한다.
+    # 끝에 붙은 조사/호칭 제거
+    # 예: "오민호는" -> "오민호"
     cleaned = re.sub(r"(은|는|이|가|을|를|의|님|씨|\?)+$", "", cleaned)
 
+    # 남은 값에서 한글 2~4글자를 이름 후보로 본다.
     match = re.search(r"[가-힣]{2,4}", cleaned)
 
     if not match:
@@ -263,23 +311,9 @@ def extract_employee_name(question: str) -> str | None:
 
     name = match.group()
 
+    # 그래도 혹시 남은 조직명/직책명/필드명은 이름으로 인정하지 않는다.
     invalid_names = set(DEPARTMENTS + TEAMS + POSITIONS)
-    invalid_names.update(
-        [
-            "부서",
-            "직원",
-            "팀원",
-            "팀장",
-            "직책",
-            "직급",
-            "이메일",
-            "주소",
-            "연봉",
-            "평가",
-            "정보",
-            "정보있",
-        ]
-    )
+    invalid_names.update(remove_words)
 
     if name in invalid_names:
         return None

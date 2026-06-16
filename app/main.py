@@ -1,7 +1,7 @@
-import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from app.services.llm_service import call_llm_completion, get_active_llm_label
 from app.services.rag_chat_service import handle_rag_chat
 
 
@@ -25,7 +25,7 @@ def root():
 @app.post("/chat")
 def chat(request: ChatRequest):
     """
-    검색 없이 Ollama 모델에 바로 질문하는 단순 테스트용 엔드포인트다.
+    검색 없이 현재 설정된 LLM에 바로 질문하는 단순 테스트용 엔드포인트다.
     실제 HR RAG 흐름은 /rag-chat에서 처리한다.
     """
 
@@ -35,20 +35,15 @@ def chat(request: ChatRequest):
             detail="질문을 입력해주세요.",
         )
 
-    response = requests.post(
-        "http://localhost:11434/api/generate",
-        json={
-            "model": "gemma3:4b",
-            "prompt": request.question,
-            "stream": False,
-        },
+    answer = call_llm_completion(
+        prompt=request.question,
+        temperature=0.1,
     )
-    result = response.json()
 
     return {
         "question": request.question,
-        "answer": result["response"],
-        "model": "gemma3:4b",
+        "answer": answer,
+        "model": get_active_llm_label(),
     }
 
 
