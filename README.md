@@ -37,7 +37,6 @@
 pipeline.py            전체 파이프라인 (1~3단계)
 config/
   user_dictionary.txt  nori 사용자 사전
-  synonym.txt          동의어 사전
 data/                  실행 시 원본 CSV를 두는 폴더 (CSV는 저장소에 포함되지 않음)
 requirements.txt       의존성
 ```
@@ -89,16 +88,72 @@ requirements.txt       의존성
 
 ## 실행
 
+데이터 적재 → 백엔드 → 프론트 순서로 진행합니다.
+
+### 1. Python 의존성 설치 (최초 1회)
 ```bash
 pip install -r requirements.txt
-python pipeline.py
 ```
 
+### 2. Node.js 의존성 설치 (최초 1회)
+Node.js LTS가 설치되어 있어야 합니다 (`node -v`로 확인).
+`server/` 폴더로 이동해서 실행합니다.
+```bash
+cd server
+npm install
+cd ..
+```
+
+### 3. 파이프라인 실행 — 데이터 적재
+```bash
+python pipeline.py
+```
 - 1~3단계가 순서대로 실행됩니다.
 - 처음 실행하면 7개 인덱스를 생성하고 전체를 적재합니다.
 - 다시 실행하면 **값이 바뀐 직원만** 다시 적재하고, 나머지는 건너뜁니다.
-- 사용자 사전(`config/user_dictionary.txt` / `synonym.txt`)이 바뀌면
-  인덱스를 자동으로 재생성합니다.
+- 사용자 사전(`config/user_dictionary.txt`)이 바뀌면 인덱스를 자동으로 재생성합니다.
+
+### 4. 백엔드(FastAPI) 실행
+```bash
+uvicorn app.main:app --reload
+```
+- `localhost:8000`에서 떠야 합니다.
+
+### 5. 프론트 서버(Express) 실행 — 새 터미널
+```bash
+cd server
+node server.js
+```
+- `localhost:3000`에서 뜹니다.
+- 상위 폴더(`dma/`)의 `index.html`을 서빙하고 `/api/*` 요청을 백엔드로 중계합니다.
+- 프록시 덕분에 CORS 문제 없이 챗봇 API 호출 가능합니다.
+
+### 6. 브라우저 접속
+```
+http://localhost:3000
+```
+
+---
+
+### 동작 흐름
+
+```
+브라우저  →  localhost:3000           (index.html 다운로드)
+브라우저  →  localhost:3000/api/...   (챗봇 요청)
+               ↓ server.js 프록시
+            localhost:8000/...        (FastAPI 백엔드)
+```
+
+### 관련 파일
+
+| 파일 | 역할 |
+|---|---|
+| `pipeline.py` | 데이터 전처리 + OpenSearch 적재 |
+| `app/main.py` | FastAPI 백엔드 (챗봇 API) |
+| `index.html` | 챗봇 UI (Alpine.js 기반, 단일 HTML 파일) |
+| `server/server.js`  | Express 프록시 서버 (정적 파일 서빙 + API 중계) |
+| `server/package.json` | Node.js 의존성 명세 |
+| `requirements.txt` | Python 의존성 명세 |
 
 ---
 
