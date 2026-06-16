@@ -7,6 +7,7 @@ from app.services.question_service import (
     compact_text,
     extract_employee_id,
     extract_employee_name,
+    extract_name_like_prefix,
     is_employee_collection_query,
     is_self_question,
 )
@@ -14,6 +15,7 @@ from app.services.hybrid_search_service import (
     ACCESSIBLE_INDICES,
     build_context,
     count_employees_by_conditions,
+    employee_name_exists,
     filter_hits_with_answer_values,
     get_allowed_field_value,
     get_category_values,
@@ -41,6 +43,31 @@ COMMON_ERROR_MESSAGE = "요청하신 정보를 확인할 수 없습니다."
 PERMISSION_DENIED_MESSAGE = "해당 정보에 접근할 권한이 없습니다."
 NO_SEARCH_RESULT_MESSAGE = "조건에 맞는 조회 결과가 없습니다."
 MAX_OUTPUT_EMPLOYEES = 50
+UNSUPPORTED_SUPERVISOR_MESSAGE = (
+    "현재 데이터에는 상사 관계 정보가 없어 상사 조회를 지원할 수 없습니다."
+)
+
+
+def is_supervisor_query(question: str) -> bool:
+    """
+    현재 인사 데이터에는 manager_id/reports_to 같은 상사 관계 필드가 없다.
+    상사 질문은 직급이나 직책으로 추론하지 않고 미지원으로 처리한다.
+    """
+
+    compact_question = compact_text(question)
+
+    supervisor_keywords = [
+        "상사",
+        "상급자",
+        "윗사람",
+        "보고라인",
+        "보고체계",
+        "결재라인",
+        "직속상관",
+        "직속상사",
+    ]
+
+    return any(keyword in compact_question for keyword in supervisor_keywords)
 
 
 def unique_keep_order(items: list[str]) -> list[str]:
@@ -242,7 +269,7 @@ def remove_hallucinated_org_values(task: dict, original_question: str) -> dict:
     if not has_employee_target:
         return normalized_task
 
-    for key in ["department", "team", "position"]:
+    for key in ["department", "team", "job_grade", "position"]:
         value = normalized_task.get(key)
 
         if value and not value_appears_in_question(original_question, value):
@@ -274,7 +301,10 @@ def remove_hallucinated_org_filters(
         field = item.get("field")
         value = item.get("value")
 
-        if field in {"department", "team", "position"}:
+        if field == "job_grade":
+            continue
+
+        if field in {"department", "team", "job_grade", "position"}:
             if not value_appears_in_question(original_question, value):
                 continue
 
@@ -848,6 +878,23 @@ def process_task(
     # task_start_time = time.perf_counter()
     #task에서 의도 출력
     intent = task.get("intent", "unknown")
+
+    if is_supervisor_query(original_question):
+        return {
+            "answer": UNSUPPORTED_SUPERVISOR_MESSAGE,
+            "sources": [],
+            "permission": {
+                "allowed": False,
+                "ignored": True,
+                "reason": "상사 관계 필드가 없어 처리할 수 없습니다.",
+                "permission_level": permission_level,
+                "required_level": 1,
+                "allowed_fields": [],
+                "denied_fields": [],
+                "is_self": bool(task.get("is_self", False)),
+            },
+        }
+
     requested_employee_collection = is_employee_collection_query(original_question)
 
     if requested_employee_collection:
@@ -867,6 +914,12 @@ def process_task(
 
     # LLM이 만든 filters를 바로 쓰지 않고 허용 필드/연산자/조직 값 기준으로 정리한다.
     filters = sanitize_filters(task.get("filters", []))
+
+    filters = remove_hallucinated_org_filters(
+        filters=filters,
+        original_question=original_question,
+        task=task,
+    )
 
     filters = remove_ambiguous_previous_task_filter(
         filters=filters,
@@ -936,6 +989,9 @@ def process_task(
     # filters에서 권한 판단에 필요한 field 목록을 꺼낸다.
     filter_fields = get_filter_fields(filters)
 
+    if intent == "unknown" and target_fields:
+        intent = "single_lookup"
+
     if intent == "unknown" or not target_fields:
         # 이 task는 조건에 맞지 않아 처리하지 않고 건너뛴다.
         # print(
@@ -1004,6 +1060,37 @@ def process_task(
             if guessed_name:
                 task["employee_name"] = guessed_name
 
+    code_extracted_name = extract_name_like_prefix(original_question)
+
+    should_validate_employee_name = (
+        intent == "single_lookup"
+        and code_extracted_name
+        and not requested_employee_collection
+        and not is_self
+        and not task.get("employee_id")
+        and (
+            not task.get("employee_name")
+            or task.get("employee_name") == code_extracted_name
+        )
+    )
+
+    if should_validate_employee_name:
+        task["employee_name"] = code_extracted_name
+
+        if not employee_name_exists(code_extracted_name):
+            return {
+                "answer": NO_SEARCH_RESULT_MESSAGE,
+                "sources": [],
+                "permission": {
+                    "allowed": True,
+                    "permission_level": permission_level,
+                    "required_level": 1,
+                    "allowed_fields": [],
+                    "denied_fields": [],
+                    "is_self": False,
+                },
+            }
+
     # 답변 필드뿐 아니라 조건 필드까지 포함해서 필요한 권한 레벨을 계산한다.
     search_related_fields = unique_keep_order(target_fields + filter_fields + sort_fields)
     # target_fields는 사용자에게 보여줄 필드, filter_fields는 검색 조건으로 필요한 필드다. 둘 다 권한 판단에 필요하다.
@@ -1037,6 +1124,22 @@ def process_task(
         #     "[TIME] process_task denied_filter:",
         #     f"{time.perf_counter() - task_start_time:.3f}s",
         # )
+        return {
+            "answer": PERMISSION_DENIED_MESSAGE,
+            "sources": [],
+            "permission": {
+                "allowed": False,
+                "permission_level": permission_level,
+                "required_level": required_level,
+                "allowed_fields": answer_fields,
+                "denied_fields": denied_fields,
+                "is_self": is_self,
+            },
+        }
+
+    identity_only_fields = {"employee", "employee_name", "employee_id"}
+
+    if denied_answer_fields and set(answer_fields).issubset(identity_only_fields):
         return {
             "answer": PERMISSION_DENIED_MESSAGE,
             "sources": [],

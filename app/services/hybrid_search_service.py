@@ -1193,6 +1193,38 @@ def get_basic_indices(permission_level: int) -> list[str]:
     ]
 
 
+def employee_name_exists(employee_name: str) -> bool:
+    """
+    hr_basic_1에서 직원 이름이 실제로 존재하는지 확인한다.
+    이름 존재 여부는 기본 인사정보 기준으로 판단한다.
+    """
+
+    if not employee_name:
+        return False
+
+    query = {
+        "size": 0,
+        "query": {
+            "bool": {
+                "should": [
+                    {"term": {"employee_name.keyword": employee_name}},
+                    {"match_phrase": {"employee_name": employee_name}},
+                    {"match_phrase": {"embedding_text": f"이름: {employee_name}"}},
+                ],
+                "minimum_should_match": 1,
+            }
+        },
+    }
+
+    response = client.search(index="hr_basic_1", body=query)
+    total = response.get("hits", {}).get("total", {})
+
+    if isinstance(total, dict):
+        return int(total.get("value", 0)) > 0
+
+    return int(total or 0) > 0
+
+
 def get_department_list(permission_level: int) -> list[str]:
     """
     조회 가능한 부서 목록을 중복 제거해서 반환한다.
@@ -1304,11 +1336,12 @@ def search_employees_by_department_or_team(
 
     indices = get_basic_indices(permission_level)
 
-    print("[DEBUG] 직원 검색 indices:", indices)
-    print("[DEBUG] 원본 검색어:", department_or_team)
 
     if not indices:
         return []
+
+    print("[DEBUG] 직원 검색 indices:", indices)
+    print("[DEBUG] 원본 검색어:", department_or_team)
 
     # =========================
     # 1. 검색어 확장
@@ -1355,6 +1388,7 @@ def search_employees_by_department_or_team(
     hits = response["hits"]["hits"]
 
     print("[DEBUG] 직원 검색 결과 수:", len(hits))
+    print(f"[SEARCH] employee_search hits={len(hits)}")
 
     return hits
 
@@ -1427,6 +1461,7 @@ def search_employees_by_conditions(
     hits = response["hits"]["hits"]
 
     print("[DEBUG] 조건 직원 검색 결과 수:", len(hits))
+    print(f"[SEARCH] condition_employee_search hits={len(hits)}")
 
     return hits
 
@@ -1522,6 +1557,7 @@ def search_employees_by_filter_conditions(
     hits = response["hits"]["hits"]
 
     print("[DEBUG] 필터 조건 검색 결과 수:", len(hits))
+    print(f"[SEARCH] filter_condition_search hits={len(hits)}")
 
     return hits
 
@@ -1630,6 +1666,7 @@ def count_employees_by_conditions(
     count = int(response.get("count", 0))
 
     print("[DEBUG] 직원 수 count 결과:", count)
+    print(f"[SEARCH] employee_count count={count}")
 
     return count
 
@@ -1882,7 +1919,10 @@ def search_hybrid(
     #     f"{time.perf_counter() - rrf_start_time:.3f}s",
     # )
 
-    # print("[DEBUG] Hybrid RRF hits count:", len(hybrid_hits))
+    print(
+        f"[SEARCH] hybrid bm25={len(bm25_hits)} "
+        f"vector={len(vector_hits)} rrf={len(hybrid_hits)}"
+    )
     # print("[TIME] search_hybrid total:", f"{time.perf_counter() - start_time:.3f}s")
 
     return hybrid_hits

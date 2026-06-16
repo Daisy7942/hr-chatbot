@@ -1,4 +1,5 @@
 from app.services.org_policy_service import DEPARTMENTS, JOB_GRADES, POSITIONS, TEAMS
+from app.services.hybrid_search_service import employee_name_exists
 from app.services.question_service import (
     compact_text,
     extract_employee_id,
@@ -55,6 +56,15 @@ NOT_TARGET_NAMES = {
     "부서",
     "직급",
     "직책",
+    "상사",
+    "상사들",
+    "상급자",
+    "윗사람",
+    "직속상사",
+    "직속상관",
+    "보고라인",
+    "보고체계",
+    "결재라인",
     "이메일",
     "전화번호",
     "주소",
@@ -322,7 +332,11 @@ def update_memory_from_tasks(
             memory.pop("last_position", None)
             continue
 
-        if task.get("employee_name"):
+        if (
+            task.get("employee_name")
+            and task.get("employee_name") not in NOT_TARGET_NAMES
+            and employee_name_exists(task["employee_name"])
+        ):
             memory["last_employee_name"] = task["employee_name"]
             memory.pop("last_employee_id", None)
             memory.pop("last_department", None)
