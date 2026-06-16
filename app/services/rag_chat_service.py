@@ -1,4 +1,5 @@
 import time
+import json
 
 from fastapi import HTTPException
 
@@ -21,6 +22,7 @@ from app.services.session_service import (
 # task 하나를 실제로 처리하는 서비스
 # 권한 판단, 검색, 답변 생성 등이 여기서 수행된다.
 from app.services.task_processor_service import process_task
+from app.services.llm_service import get_active_llm_label
 
 
 def handle_rag_chat(question: str, employee_id: str) -> dict:
@@ -29,16 +31,18 @@ def handle_rag_chat(question: str, employee_id: str) -> dict:
 
     전체 흐름:
     1. 요청자 사번 정리
-    2. 요청자의 권한 레벨 조회
-    3. 이전 대화 기억을 이용해 후속 질문 보강
-    4. LLM으로 질문을 task 목록으로 분해
-    5. task를 코드에서 안전하게 정규화
-    6. task별로 권한 판단, 검색, 답변 생성
-    7. 최종 응답 형태로 조립
+    2. 요청자가 바뀐 경우 이전 대화 기억 초기화
+    3. 요청자의 권한 레벨 조회
+    4. 이전 대화 기억을 이용해 후속 질문 보강
+    5. LLM으로 질문을 task 목록으로 분해
+    6. task를 코드에서 안전하게 정규화
+    7. task별로 권한 판단, 검색, 답변 생성
+    8. 대화 기억 업데이트
+    9. 최종 응답 형태로 조립
     """
 
     # 전체 요청 처리 시간을 측정하기 위한 시작 시간
-    request_start_time = time.perf_counter()
+    # request_start_time = time.perf_counter()
 
     # 사번 앞뒤 공백 제거 후 대문자로 통일
     # 예: emp0070 -> EMP0070
@@ -51,17 +55,17 @@ def handle_rag_chat(question: str, employee_id: str) -> dict:
     # =========================
 
     # 권한 조회에 걸리는 시간을 측정하기 위한 시작 시간
-    permission_start_time = time.perf_counter()
+    # permission_start_time = time.perf_counter()
 
     # 요청자 사번을 기준으로 permission_level 조회
     # 예: 일반 직원 1, 중간 권한 2, 관리자 3
     permission_level = get_user_permission_level(employee_id)
 
     # 권한 조회 소요 시간 출력
-    print(
-        "[TIME] get_user_permission_level:",
-        f"{time.perf_counter() - permission_start_time:.3f}s",
-    )
+    # print(
+    #     "[TIME] get_user_permission_level:",
+    #     f"{time.perf_counter() - permission_start_time:.3f}s",
+    # )
 
     # 요청자 사번이 존재하지 않으면 404 에러 반환
     if permission_level is None:
@@ -101,7 +105,7 @@ def handle_rag_chat(question: str, employee_id: str) -> dict:
     # =========================
 
     # LLM 질문 분석 시간 측정 시작
-    analyze_start_time = time.perf_counter()
+    # analyze_start_time = time.perf_counter()
 
     # 자연어 질문을 LLM에게 보내서 task 목록으로 분해한다.
     #
@@ -118,17 +122,17 @@ def handle_rag_chat(question: str, employee_id: str) -> dict:
     analysis = analyze_question_to_tasks(resolved_question)
 
     # LLM 분석 소요 시간 출력
-    print(
-        "[TIME] analyze_question_to_tasks:",
-        f"{time.perf_counter() - analyze_start_time:.3f}s",
-    )
+    # print(
+    #     "[TIME] analyze_question_to_tasks:",
+    #     f"{time.perf_counter() - analyze_start_time:.3f}s",
+    # )
 
     # =========================
     # 4. task 정규화
     # =========================
 
     # 정규화 시간 측정 시작
-    normalize_start_time = time.perf_counter()
+    # normalize_start_time = time.perf_counter()
 
     # LLM이 만든 결과를 코드에서 다시 안전하게 정리한다.
     #
@@ -136,21 +140,25 @@ def handle_rag_chat(question: str, employee_id: str) -> dict:
     # LLM이 잘못된 intent나 field를 줄 수 있기 때문에
     # 허용된 intent / 허용된 field만 남기도록 보정한다.
     tasks = normalize_tasks(analysis, resolved_question)
+    print(
+        "[DEBUG] normalized tasks:",
+        json.dumps(tasks, ensure_ascii=False),
+    )
 
     # 정규화 소요 시간과 task 개수 출력
-    print(
-        "[TIME] normalize_tasks:",
-        f"{time.perf_counter() - normalize_start_time:.3f}s",
-        "tasks:",
-        len(tasks),
-    )
+    # print(
+    #     "[TIME] normalize_tasks:",
+    #     f"{time.perf_counter() - normalize_start_time:.3f}s",
+    #     "tasks:",
+    #     len(tasks),
+    # )
 
     # =========================
     # 5. task별 처리
     # =========================
 
     # 전체 task 처리 시간 측정 시작
-    tasks_start_time = time.perf_counter()
+    # tasks_start_time = time.perf_counter()
 
     # task 하나마다 독립적으로 처리한다.
     #
@@ -184,10 +192,10 @@ def handle_rag_chat(question: str, employee_id: str) -> dict:
     )
 
     # 전체 task 처리 소요 시간 출력
-    print(
-        "[TIME] all process_task:",
-        f"{time.perf_counter() - tasks_start_time:.3f}s",
-    )
+    # print(
+    #     "[TIME] all process_task:",
+    #     f"{time.perf_counter() - tasks_start_time:.3f}s",
+    # )
 
     # =========================
     # 7. 답변 모으기
@@ -210,10 +218,10 @@ def handle_rag_chat(question: str, employee_id: str) -> dict:
         sources.extend(result.get("sources", []))
 
     # 전체 /rag-chat 처리 시간 출력
-    print(
-        "[TIME] rag_chat total:",
-        f"{time.perf_counter() - request_start_time:.3f}s",
-    )
+    # print(
+    #     "[TIME] rag_chat total:",
+    #     f"{time.perf_counter() - request_start_time:.3f}s",
+    # )
 
     # =========================
     # 9. 최종 응답 조립
@@ -249,5 +257,5 @@ def handle_rag_chat(question: str, employee_id: str) -> dict:
         "resolved_question": resolved_question,
 
         # 사용한 LLM 모델명
-        "model_type": "gemma3:4b",
+        "model_type": get_active_llm_label(),
     }

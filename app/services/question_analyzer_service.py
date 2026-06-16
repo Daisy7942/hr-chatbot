@@ -1,6 +1,7 @@
 import json
 import re
 import requests
+from app.services.llm_service import call_llm_completion
 
 from app.services.question_service import (
     extract_employee_id,
@@ -21,8 +22,9 @@ from app.services.org_policy_service import (
 )
 
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "gemma3:4b"
+# Gemma/Ollama로 되돌릴 때 참고용으로 남겨둔다.
+# OLLAMA_URL = "http://localhost:11434/api/generate"
+# MODEL_NAME = "gemma3:4b"
 
 
 DEFAULT_TASK = {
@@ -34,18 +36,21 @@ DEFAULT_TASK = {
     "team": None,
     "position": None,
     "filters": [],
+    "sort": None,
     "is_self": False,
 }
 
 
 ALLOWED_FILTER_OPS = {
-    "eq", # 정확히 일치
+    "eq",        # 정확히 일치
     "contains", # 포함
-    "gt", # 초과
-    "gte", # 이상
-    "lt", # 미만
-    "lte", # 이하
-    "between", # 범위 (예: 2020년 평가 between A and C)
+    "gt",       # 초과
+    "gte",      # 이상
+    "lt",       # 미만
+    "lte",      # 이하
+    "between",  # 범위
+    "is_date",  # YYYY-MM-DD 날짜 형식인지 확인
+    "exists",   # 값이 실제로 입력되어 있는지 확인
 }
 
 
@@ -97,6 +102,133 @@ def clean_json_text(text: str) -> str:
 
     return text
 
+def to_none(value):
+    """
+    LLM이 반환한 NULL 문자열을 Python None으로 바꾼다.
+    """
+
+    if value is None:
+        return None
+
+    value = str(value).strip()
+
+    if not value or value.upper() == "NULL":
+        return None
+
+    return value
+
+
+def parse_bool(value) -> bool:
+    """
+    true / false 문자열을 bool 값으로 바꾼다.
+    """
+
+    return str(value).strip().lower() == "true"
+
+
+def parse_target_fields(value) -> list[str]:
+    """
+    target_fields=employee_name,department 형태를 리스트로 바꾼다.
+    """
+
+    value = to_none(value)
+
+    if not value:
+        return ["unknown"]
+
+    fields = [
+        item.strip()
+        for item in str(value).split(",")
+        if item.strip()
+    ]
+
+    if not fields:
+        return ["unknown"]
+
+    return fields
+
+
+def parse_filters(value) -> list[dict]:
+    """
+    filters=field|op|value 형태를 filters 리스트로 바꾼다.
+
+    예:
+    filters=hire_date|contains|2024
+    ->
+    [{"field": "hire_date", "op": "contains", "value": "2024"}]
+    """
+
+    value = to_none(value)
+
+    if not value:
+        return []
+
+    filters = []
+
+    normalized_value = re.sub(r"\s+and\s+", ";", str(value), flags=re.IGNORECASE)
+
+    for raw_filter in normalized_value.split(";"):
+        parts = [
+            item.strip()
+            for item in raw_filter.split("|")
+        ]
+
+        if len(parts) != 3:
+            continue
+
+        field, op, filter_value = parts
+        filter_value = to_none(filter_value)
+
+        if filter_value is None:
+            continue
+
+        filters.append(
+            {
+                "field": field,
+                "op": op,
+                "value": filter_value,
+            }
+        )
+
+    return filters
+
+
+def parse_key_value_analysis(raw_text: str) -> dict:
+    """
+    LLM이 반환한 key=value 텍스트를 기존 {"tasks": [task]} 구조로 조립한다.
+    """
+
+    parsed = {}
+
+    for line in raw_text.splitlines():
+        line = line.strip()
+
+        if not line:
+            continue
+
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        parsed[key.strip()] = value.strip()
+
+    task = {
+        "intent": to_none(parsed.get("intent")) or "unknown",
+        "target_fields": parse_target_fields(parsed.get("target_fields")),
+        "employee_name": to_none(parsed.get("employee_name")),
+        "employee_id": to_none(parsed.get("employee_id")),
+        "department": to_none(parsed.get("department")),
+        "team": to_none(parsed.get("team")),
+        "position": to_none(parsed.get("position")),
+        "filters": parse_filters(parsed.get("filters")),
+        "sort": None,
+        "is_self": parse_bool(parsed.get("is_self")),
+    }
+
+    return {
+        "tasks": [task]
+    }
+
 
 def compact_text(text: str) -> str:
     """
@@ -137,6 +269,32 @@ def build_fallback_analysis(question: str) -> dict:
 
     compact_question = compact_text(question)
     target_fields = []
+
+    if (
+        is_employee_collection_query(question)
+        and ("퇴사" in compact_question or "퇴직" in compact_question)
+    ):
+        return {
+            "tasks": [
+                {
+                    "intent": "condition_search",
+                    "target_fields": ["employee"],
+                    "employee_name": None,
+                    "employee_id": None,
+                    "department": None,
+                    "team": None,
+                    "position": None,
+                    "filters": [
+                        {
+                            "field": "retirement_date",
+                            "op": "exists",
+                            "value": True,
+                        }
+                    ],
+                    "is_self": False,
+                }
+            ]
+        }
 
     keyword_to_field = [
         (["주민등록번호", "주민번호"], "rrn"),
@@ -386,11 +544,17 @@ def normalize_semantic_filters(filters: list[dict], question: str) -> list[dict]
     return normalized_filters
 
 
-def normalize_hire_year_filter(filters: list[dict], question: str) -> list[dict]:
-    compact_question = compact_text(question)
+def normalize_employee_date_year_filter(filters: list[dict], question: str) -> list[dict]:
+    """
+    '2024년에 입사한 사람', '2024년에 퇴사한 사람' 같은 질문을
+    날짜 조건 필터로 보정한다.
 
-    if "입사" not in compact_question:
-        return filters
+    예:
+    - 2024년에 입사한 사람 -> hire_date contains 2024
+    - 2024년에 퇴사한 사람 -> retirement_date contains 2024
+    """
+
+    compact_question = compact_text(question)
 
     year_match = re.search(r"(19|20)\d{2}", compact_question)
 
@@ -399,12 +563,196 @@ def normalize_hire_year_filter(filters: list[dict], question: str) -> list[dict]
 
     year = year_match.group()
 
-    return add_filter_if_missing(
-        filters=filters,
-        field="hire_date",
-        op="contains",
-        value=year,
+    if "입사" in compact_question:
+        filters = add_filter_if_missing(
+            filters=filters,
+            field="hire_date",
+            op="contains",
+            value=year,
+        )
+
+    if "퇴사" in compact_question or "퇴직" in compact_question:
+        filters = add_filter_if_missing(
+            filters=filters,
+            field="retirement_date",
+            op="contains",
+            value=year,
+        )
+
+    return filters
+def normalize_retired_employee_filter(filters: list[dict], question: str) -> list[dict]:
+    """
+    '퇴사한 사람', '퇴직자'처럼 연도가 없는 퇴사자 질문을 보정한다.
+
+    데이터 기준:
+    - 퇴직일자: 미입력       -> 재직자
+    - 퇴직일자: 2024-10-17  -> 퇴사자
+
+    따라서 퇴사자는 retirement_date 값이 "미입력"이 아닌 사람으로 본다.
+    """
+
+    compact_question = compact_text(question)
+
+    retirement_keywords = ["퇴사", "퇴직", "퇴사자", "퇴직자"]
+    collection_keywords = ["사람", "직원", "사원", "대상자", "퇴사자", "퇴직자"]
+
+    # 퇴사/퇴직 관련 질문이 아니면 건드리지 않는다.
+    if not any(keyword in compact_question for keyword in retirement_keywords):
+        return filters
+
+    # 직원 집합을 묻는 질문이 아니면 건드리지 않는다.
+    if not any(keyword in compact_question for keyword in collection_keywords):
+        return filters
+
+    filters = [
+        item
+        for item in filters
+        if not (
+            item.get("field") == "retirement_date"
+            and to_none(item.get("value")) is None
+        )
+    ]
+
+    # 이미 유효한 퇴직일자 조건이 있으면 추가하지 않는다.
+    # 예: "2024년 퇴사한 사람"은 contains 2024가 이미 들어간다.
+    for item in filters:
+        if item.get("field") == "retirement_date":
+            return filters
+
+    filters.append(
+        {
+            "field": "retirement_date",
+            "op": "exists",
+            "value": True,
+        }
     )
+
+    return filters
+
+
+def normalize_numeric_threshold_filters(filters: list[dict], question: str) -> list[dict]:
+    """
+    "근속기간 10년 이상", "성과점수 80점 이상" 같은 숫자 조건을 보정한다.
+    """
+
+    compact_question = compact_text(question)
+
+    numeric_targets = [
+        {
+            "field": "tenure",
+            "keywords": ["근속기간", "근속"],
+            "unit": "년",
+        },
+        {
+            "field": "performance_score",
+            "keywords": ["성과점수", "성과"],
+            "unit": "점",
+        },
+        {
+            "field": "age",
+            "keywords": ["나이"],
+            "unit": "세",
+        },
+        {
+            "field": "overtime",
+            "keywords": ["잔업시간", "잔업"],
+            "unit": "시간",
+        },
+        {
+            "field": "unused_vacation",
+            "keywords": ["미사용휴가일수", "미사용휴가"],
+            "unit": "일",
+        },
+    ]
+
+    op_by_word = {
+        "이상": "gte",
+        "이하": "lte",
+        "초과": "gt",
+        "미만": "lt",
+    }
+
+    for target in numeric_targets:
+        if not any(keyword in compact_question for keyword in target["keywords"]):
+            continue
+
+        for word, op in op_by_word.items():
+            patterns = [
+                rf"(?:{'|'.join(target['keywords'])})(\d+)(?:{target['unit']})?{word}",
+                rf"(\d+)(?:{target['unit']})?{word}(?:.*)(?:{'|'.join(target['keywords'])})",
+            ]
+
+            for pattern in patterns:
+                match = re.search(pattern, compact_question)
+
+                if not match:
+                    continue
+
+                filters = add_filter_if_missing(
+                    filters=filters,
+                    field=target["field"],
+                    op=op,
+                    value=match.group(1),
+                )
+                break
+
+    return filters
+
+
+def infer_sort_from_question(question: str) -> dict | None:
+    """
+    "가장 높은/낮은/오래된" 같은 표현을 정렬 조건으로 바꾼다.
+    """
+
+    compact_question = compact_text(question)
+
+    sort_keywords = [
+        "가장",
+        "제일",
+        "최고",
+        "최저",
+        "높은",
+        "낮은",
+        "많은",
+        "적은",
+        "긴",
+        "짧은",
+        "오래",
+    ]
+
+    if not any(keyword in compact_question for keyword in sort_keywords):
+        return None
+
+    sort_field = None
+
+    if "근속" in compact_question:
+        sort_field = "tenure"
+    elif "성과점수" in compact_question or "성과" in compact_question:
+        sort_field = "performance_score"
+    elif "평가" in compact_question or "고과" in compact_question:
+        sort_field = get_evaluation_field_from_question(compact_question)
+    elif "연봉" in compact_question or "급여" in compact_question:
+        sort_field = "salary"
+    elif "나이" in compact_question:
+        sort_field = "age"
+    elif "잔업" in compact_question:
+        sort_field = "overtime"
+    elif "미사용휴가" in compact_question:
+        sort_field = "unused_vacation"
+
+    if not sort_field:
+        return None
+
+    ascending_keywords = ["최저", "낮은", "적은", "짧은"]
+    order = "asc" if any(keyword in compact_question for keyword in ascending_keywords) else "desc"
+
+    return {
+        "field": sort_field,
+        "order": order,
+        "limit": 1,
+    }
+
+
 
 
 def normalize_target_fields_by_question(
@@ -597,6 +945,9 @@ def normalize_filters(raw_filters) -> list[dict]:
         if value is None or value == "":
             continue
 
+        if isinstance(value, str) and value.strip().upper() == "NULL":
+            continue
+
         # =========================
         # 7. 부서/팀/직책 값 검증
         # =========================
@@ -663,125 +1014,187 @@ def analyze_question_to_tasks(question: str) -> dict:
 
 
     prompt = f"""
-You are a parser for a Korean HR RAG API.
-Return only one valid JSON object. Do not use markdown.
+        너는 한국어 HR RAG API의 질문 분석기다.
+        JSON을 만들지 말고, 아래 key=value 9줄만 반환해라.
+        마크다운, 설명, 코드블록, 중괄호, 대괄호를 절대 쓰지 마라.
 
-Allowed intents:
-- single_lookup: ask one employee's field
-- employee_list: ask employees in an org/position
-- employee_count: ask how many employees match an org/position/condition
-- category_list: ask available department/team/job_grade/position values
-- condition_search: ask employees or fields matching filters
-- unknown: cannot classify
+        반환 형식:
+        intent=
+        target_fields=
+        employee_name=
+        employee_id=
+        department=
+        team=
+        position=
+        filters=
+        is_self=
 
-Allowed fields:
-{field_schema_text}
+        사용 가능한 intent:
+        single_lookup, employee_list, employee_count, category_list, condition_search, unknown
 
-Rules:
-- target_fields are the fields the user wants to see.
-- filters are search conditions, not answer fields.
-- If the question means "me", "my", "나", "내", or "본인", set is_self true.
-- Self words are: "\ub098", "\ub0b4", "\ubcf8\uc778", "\ub0b4\uc774\ub984".
-- For self questions, keep employee_name null unless another person's real name is mentioned.
-- Never set employee_name to "\ub098", "\ub0b4", "\ubcf8\uc778", "\ub0b4\uc774\ub984", or any phrase that means the requester.
-- Do not invent employee_id. Only set employee_id when the question contains an EMP number.
-- If a person name is mentioned, set employee_name.
-- Use only allowed fields. If unsure, use ["unknown"].
-- Use filter ops only from: eq, contains, gt, gte, lt, lte, between.
-- Do not decide permissions.
-- If the question asks "몇 명", "몇명", "인원수", "인원", "명수", or employee count, use intent employee_count and target_fields ["employee"].
+        사용 가능한 fields:
+        {field_schema_text}
 
-Field hints:
-- \uc774\ub984, \uc131\uba85, \ub0b4\uc774\ub984 -> employee_name
-- \uc0ac\ubc88, \uc9c1\uc6d0\ubc88\ud638 -> employee_id
-- \ubd80\uc11c -> department
-- \ud300 -> team
-- \uc9c1\uae09 -> job_grade
-- \uc9c1\ucc45, \ud3ec\uc9c0\uc158 -> position
-- \uc774\uba54\uc77c, \uba54\uc77c -> email
-- \uc804\ud654\ubc88\ud638, \uc5f0\ub77d\ucc98, \ud734\ub300\ud3f0 -> phone
-- \uc8fc\uc18c -> address
-- \uc5f0\ubd09, \uae09\uc5ec -> salary
-- \uc785\uc0ac\uc77c -> hire_date
-- \uacc4\uc57d\uc9c1, \uc815\uaddc\uc9c1, \uacc4\uc57d\ud615\ud0dc -> contract_type
-- \uc131\uacfc\uc810\uc218 -> performance_score
-- \ud3c9\uac00, \uace0\uacfc, \uc778\uc0ac\ud3c9\uac00 -> evaluation_2024
-- \uc8fc\ubbfc\ub4f1\ub85d\ubc88\ud638, \uc8fc\ubbfc\ubc88\ud638 -> rrn
-- 이름, 성명, 내이름 -> employee_name
-- 사번, 직원번호 -> employee_id
-- 부서 -> department
-- 팀 -> team
-- 직급 -> job_grade
-- 직책, 포지션 -> position
-- 이메일, 메일 -> email
-- 전화번호, 연락처, 휴대폰 -> phone
-- 주소 -> address
-- 연봉, 급여 -> salary
-- 입사일 -> hire_date
-- 계약직, 정규직, 계약형태 -> contract_type
-- 성과점수 -> performance_score
-- 평가, 고과, 인사평가 -> evaluation_2024
-- 주민등록번호, 주민번호 -> rrn
+        규칙:
+        - 값이 없으면 NULL을 쓴다.
+        - target_fields가 여러 개면 쉼표로 구분한다.
+        - filters가 없으면 NULL을 쓴다.
+        - filters 형식은 field|op|value 이다.
+        - filters가 여러 개면 세미콜론(;)으로 구분한다.
+        - is_self는 true 또는 false만 쓴다.
+        - target_fields는 사용자가 답변으로 보고 싶어 하는 필드다.
+        - filters는 검색 조건이며 답변 필드가 아니다.
+        - 권한 판단은 하지 않는다.
+        - 사용 가능한 fields만 사용한다.
+        - 확실하지 않으면 target_fields=unknown 으로 둔다.
+        - filter op는 eq, contains, gt, gte, lt, lte, between, exists 중 하나만 사용한다.
 
-Return this exact shape:
-{{
-  "tasks": [
-    {{
-      "intent": "single_lookup",
-      "target_fields": ["employee_name"],
-      "employee_name": null,
-      "employee_id": null,
-      "department": null,
-      "team": null,
-      "position": null,
-      "filters": [],
-      "is_self": false
-    }}
-  ]
-}}
+        본인 질문 규칙:
+        - "나", "내", "본인", "내이름", "me", "my"를 의미하면 is_self=true.
+        - 본인 질문이면 다른 사람 이름이 명확히 나온 경우가 아니면 employee_name=NULL.
+        - employee_name에 "나", "내", "본인", "내이름"을 넣지 마라.
 
-User question:
-{question}
-"""
+        이름 판단 규칙:
+        - employee_name은 실제 사람 이름이 명확히 언급된 경우에만 넣는다.
+        - 사람 이름이 확실하지 않으면 employee_name=NULL.
+        - 업무명, 부서명, 팀명, 직책명, 직급명, 고용형태, 조건 표현은 employee_name이 아니다.
+        - "인사업무", "영업업무", "마케팅업무", "담당자", "계약직", "정규직", "입사자", "퇴직자", "팀장", "부서장", "직원", "사람"은 employee_name이 아니다.
+        - "업무 담당자 누구야?"는 특정 사람 이름 조회가 아니라 조건에 맞는 직원 조회다.
+
+        intent 판단:
+        - 특정 직원 1명의 정보를 묻는 질문이면 single_lookup.
+        - 조직/직책/조건에 맞는 직원 목록이면 employee_list 또는 condition_search.
+        - 조건 필터가 필요한 직원 조회는 condition_search.
+        - "몇 명", "몇명", "인원수", "인원", "명수"가 있으면 employee_count, target_fields=employee.
+        - 부서/팀/직급/직책 종류나 목록을 물으면 category_list.
+
+        Field hints:
+        - 이름, 성명 -> employee_name
+        - 사번, 직원번호 -> employee_id
+        - 부서 -> department
+        - 팀 -> team
+        - 직급 -> job_grade
+        - 직책, 포지션 -> position
+        - 이메일, 메일 -> email
+        - 전화번호, 연락처, 휴대폰 -> phone
+        - 주소 -> address
+        - 연봉, 급여 -> salary
+        - 입사일 -> hire_date
+        - 퇴직일, 퇴직일자 -> retirement_date
+        - 계약직, 정규직, 계약형태 -> contract_type
+        - 성과점수 -> performance_score
+        - 평가, 고과, 인사평가 -> evaluation_2024
+        - 주민등록번호, 주민번호 -> rrn
+
+        조건 예시:
+        - 2024년에 입사한 사람 -> filters=hire_date|contains|2024
+        - 2024년에 퇴직한 사람 -> filters=retirement_date|contains|2024
+        - 퇴사한 사람, 퇴직자 -> filters=retirement_date|exists|true
+        - 계약직 직원 -> filters=contract_type|eq|계약직
+        - 인사부 직원 -> department=인사부, filters=department|eq|인사부
+        - 백엔드팀 직원 -> team=백엔드팀, filters=team|eq|백엔드팀
+        - 팀장 누구야 -> position=팀장, filters=position|eq|팀장
+        - 인사 업무 담당자 누구야 -> department=인사부, filters=department|eq|인사부
+
+        출력 예시:
+        intent=condition_search
+        target_fields=employee
+        employee_name=NULL
+        employee_id=NULL
+        department=인사부
+        team=NULL
+        position=NULL
+        filters=department|eq|인사부
+        is_self=false
+
+        날짜/연도 조건 규칙:
+
+        1. "2024년도", "2024년"처럼 특정 연도만 말하면 eq를 사용한다.
+        예: "2024년도 입사자" → hire_date|eq|2024
+        예: "2024년에 입사한 사람" → hire_date|eq|2024
+
+        2. "2024년 이전", "2024년까지", "2024년 이하"라고 명시된 경우에만 lte를 사용한다.
+        예: "2024년 이전 입사자" → hire_date|lte|2024
+        예: "2024년까지 입사한 사람" → hire_date|lte|2024
+
+        3. "2024년 이후", "2024년부터", "2024년 이상"이라고 명시된 경우에만 gte를 사용한다.
+        예: "2024년 이후 입사자" → hire_date|gte|2024
+        예: "2024년부터 입사한 사람" → hire_date|gte|2024
+
+        4. "2024년 3월", "2024-03"처럼 월까지 말하면 eq를 사용한다.
+        예: "2024년 3월 입사자" → hire_date|eq|2024-03
+
+        5. "2024년 3월 15일", "2024-03-15"처럼 정확한 날짜를 말하면 eq를 사용한다.
+        예: "2024년 3월 15일 입사자" → hire_date|eq|2024-03-15
+
+        주의:
+        - 사용자가 "이전", "까지", "이하"라고 말하지 않았으면 lte를 쓰지 않는다.
+        - 사용자가 "이후", "부터", "이상"이라고 말하지 않았으면 gte를 쓰지 않는다.
+        - 단순히 "2024년도"라고만 말하면 반드시 eq를 사용한다.
+
+    사용자 질문:
+    {question}
+    """
+
 
     try:
-        response = requests.post(
-            OLLAMA_URL,
-            json={
-                "model": MODEL_NAME,
-                "prompt": prompt,
-                "stream": False,
-                "format": "json",
-                "options": {
-                    "temperature": 0,
-                    "num_predict": 400, 
-                    # Keep the parser output short so the JSON object closes reliably.
-                },
-            },
+        raw_text = call_llm_completion(
+            prompt=prompt,
+            temperature=0,
+            max_tokens=400,
             timeout=180,
-        )
+        ).strip()
+        print("[DEBUG] question analysis raw:", raw_text)
 
-        # http 요청 실패는 예외로 처리한다. 타임아웃, 연결 오류, 4xx/5xx 응답 등
-        response.raise_for_status()
+        # Gemma/Ollama 호출로 되돌릴 때 참고용으로 남겨둔다.
+        # response = requests.post(
+        #     OLLAMA_URL,
+        #     json={
+        #         "model": MODEL_NAME,
+        #         "prompt": prompt,
+        #         "stream": False,
+        #         "options": {
+        #             "temperature": 0,
+        #             "num_predict": 400,
+        #         },
+        #     },
+        #     timeout=180,
+        # )
+        # response.raise_for_status()
+        # raw_text = response.json().get("response", "").strip()
 
-        raw_text = response.json().get("response", "").strip()
-        json_text = clean_json_text(raw_text)
 
         try:
-            #json 형식을 python dict로 변환한다.
-            return json.loads(json_text)
-        except json.JSONDecodeError:
-            print("[ERROR] 질문 분석 결과 JSON 변환 실패")
+            analysis = parse_key_value_analysis(raw_text)
+            print(
+                "[DEBUG] question analysis parsed:",
+                json.dumps(analysis, ensure_ascii=False),
+            )
+            return analysis
+
+        except Exception as e:
+            print("[ERROR] 질문 분석 결과 key=value 변환 실패")
+            print("[DEBUG] error:", e)
             print("[DEBUG] raw_text:", raw_text)
             return build_fallback_analysis(question)
 
     except requests.exceptions.Timeout:
         print("[ERROR] 질문 분석 LLM 요청 시간 초과")
-        return {"tasks": [DEFAULT_TASK.copy()]}
+        fallback = build_fallback_analysis(question)
+        print(
+            "[DEBUG] question analysis fallback:",
+            json.dumps(fallback, ensure_ascii=False),
+        )
+        return fallback
 
-    except requests.exceptions.RequestException as e:
+    except (requests.exceptions.RequestException, ValueError) as e:
         print("[ERROR] 질문 분석 LLM 요청 실패:", e)
-        return {"tasks": [DEFAULT_TASK.copy()]}
+        fallback = build_fallback_analysis(question)
+        print(
+            "[DEBUG] question analysis fallback:",
+            json.dumps(fallback, ensure_ascii=False),
+        )
+        return fallback
 
 
 def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
@@ -1013,7 +1426,10 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
         # "성과 좋은 직원" 같은 표현이 있으면
         # performance 관련 조건으로 보정할 수 있다.
         filters = normalize_semantic_filters(filters, question)
-        filters = normalize_hire_year_filter(filters, question)
+        filters = normalize_employee_date_year_filter(filters, question)
+        filters = normalize_retired_employee_filter(filters, question)
+        filters = normalize_numeric_threshold_filters(filters, question)
+        sort = infer_sort_from_question(question)
 
         # 질문에서 부서가 확인되었으면 filters에 department 조건을 추가한다.
         #
@@ -1104,11 +1520,14 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
             intent = "employee_count"
             safe_fields = ["employee"]
 
-        if requested_employee_collection:
+        elif requested_employee_collection:
             intent = "condition_search"
 
             if safe_fields == ["unknown"]:
                 safe_fields = ["employee"]
+
+        if sort and safe_fields != ["unknown"] and sort["field"] not in safe_fields:
+            safe_fields.append(sort["field"])
 
         # -------------------------
         # 5. 직원 식별 정보 정규화
@@ -1174,6 +1593,7 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
                 "team": team,
                 "position": position,
                 "filters": filters,
+                "sort": sort,
                 "is_self": bool(task.get("is_self", False)),
             }
         )

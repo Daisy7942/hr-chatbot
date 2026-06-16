@@ -1,5 +1,6 @@
 import re
 import time
+import json
 
 from app.services.llm_service import generate_answer
 from app.services.question_service import (
@@ -18,6 +19,8 @@ from app.services.hybrid_search_service import (
     get_category_values,
     make_sources,
     search_employees_by_conditions,
+    search_employees_by_filter_conditions,
+    search_hits_by_employee_ids,
     search_hybrid,
 )
 from app.services.query_policy_service import (
@@ -36,6 +39,7 @@ from app.services.org_policy_service import (
 COMMON_ERROR_MESSAGE = "요청하신 정보를 확인할 수 없습니다."
 PERMISSION_DENIED_MESSAGE = "해당 정보에 접근할 권한이 없습니다."
 NO_SEARCH_RESULT_MESSAGE = "조건에 맞는 조회 결과가 없습니다."
+MAX_OUTPUT_EMPLOYEES = 50
 
 
 def unique_keep_order(items: list[str]) -> list[str]:
@@ -149,7 +153,7 @@ def sanitize_filters(filters: list[dict]) -> list[dict]:
     if not isinstance(filters, list):
         return []
 
-    allowed_ops = {"eq", "contains", "gt", "gte", "lt", "lte", "between"}
+    allowed_ops = {"eq", "contains", "gt", "gte", "lt", "lte", "between", "exists"}
     safe_filters = []
 
     for item in filters:
@@ -164,6 +168,9 @@ def sanitize_filters(filters: list[dict]) -> list[dict]:
             continue
 
         if value is None or value == "":
+            continue
+
+        if isinstance(value, str) and value.strip().upper() == "NULL":
             continue
 
         if op not in allowed_ops:
@@ -349,12 +356,16 @@ def build_task_question(original_question: str, task: dict) -> str:
 
     parts = [original_question]
     # 원본질문에 LLM이 추출한 이름, 사번, 부서, 팀, 포지션이 포함되어있지 않으면 parts에 추가
-    for key in ["employee_name", "employee_id", "department", "team", "position"]:
+    identity_keys = ["employee_id"]
+
+    if task.get("intent") == "single_lookup":
+        identity_keys.insert(0, "employee_name")
+
+    for key in identity_keys + ["department", "team", "position"]:
         value = task.get(key)
 
         if value and str(value) not in " ".join(parts):
             parts.append(str(value))
-
 
     # 원본질문에 LLM이 추출한 filters의 각 value값들이 포함되어있지 않으면 parts에 추가
     filters = task.get("filters", [])
@@ -380,7 +391,48 @@ def build_task_question(original_question: str, task: dict) -> str:
     return " ".join(parts)
 
 
-def format_allowed_hits_answer(hits: list[dict], allowed_fields: list[str]) -> str:
+def limit_hits_by_employee_count(
+    hits: list[dict],
+    limit: int = MAX_OUTPUT_EMPLOYEES,
+) -> list[dict]:
+    """
+    검색/검증은 전체로 하되, 최종 출력은 employee_id 기준 최대 limit명으로 제한한다.
+    같은 직원의 여러 문서는 함께 유지한다.
+    """
+
+    if not hits or limit <= 0:
+        return []
+
+    selected_employee_ids = []
+    limited_hits = []
+    fallback_count = 0
+
+    for hit in hits:
+        employee_id = hit.get("_source", {}).get("employee_id")
+
+        if not employee_id:
+            if fallback_count < limit:
+                limited_hits.append(hit)
+                fallback_count += 1
+            continue
+
+        if employee_id not in selected_employee_ids:
+            if len(selected_employee_ids) >= limit:
+                continue
+
+            selected_employee_ids.append(employee_id)
+
+        if employee_id in selected_employee_ids:
+            limited_hits.append(hit)
+
+    return limited_hits
+
+
+def format_allowed_hits_answer(
+    hits: list[dict],
+    allowed_fields: list[str],
+    limit: int = MAX_OUTPUT_EMPLOYEES,
+) -> str:
     """
     검색 결과(hits)를 사용자에게 보여줄 답변 문자열로 변환한다.
 
@@ -390,7 +442,10 @@ def format_allowed_hits_answer(hits: list[dict], allowed_fields: list[str]) -> s
     """
 
     # 검색 결과에서 사용자에게 보여줘도 되는 필드만 추출한다.
-    source_items = make_sources(hits, allowed_fields=allowed_fields)
+    source_items = make_sources(
+        limit_hits_by_employee_count(hits, limit=limit),
+        allowed_fields=allowed_fields,
+    )
 
     # 보여줄 데이터가 없으면 조회 결과 없음 메시지를 반환한다.
     if not source_items:
@@ -529,6 +584,23 @@ def filter_match(actual_value, op: str, expected_value) -> bool:
     actual_text = str(actual_value).strip()
     expected_text = str(expected_value).strip()
 
+    evaluation_aliases = {
+        "우수": "A",
+        "탁월": "A",
+        "최상": "A",
+        "좋음": "A",
+        "양호": "B",
+        "보통": "C",
+        "미흡": "D",
+        "부진": "D",
+    }
+
+    expected_text = evaluation_aliases.get(expected_text, expected_text)
+
+    if op == "exists":
+        missing_values = {"미입력", "NULL", "None", "none", "null", "-"}
+        return actual_text not in missing_values
+
     if op == "eq":
         return actual_text == expected_text
 
@@ -566,6 +638,7 @@ def filter_match(actual_value, op: str, expected_value) -> bool:
             return False
 
         return start_number <= actual_number <= end_number
+    
 
     return False
 
@@ -639,6 +712,102 @@ def filter_hits_by_filters(hits: list[dict], filters: list[dict]) -> list[dict]:
     ]
 
 
+EVALUATION_SORT_SCORE = {
+    "A": 4,
+    "B": 3,
+    "C": 2,
+    "D": 1,
+}
+
+
+def get_sort_value_from_hits(employee_hits: list[dict], field_key: str):
+    for hit in employee_hits:
+        source = hit.get("_source", {})
+        embedding_text = source.get("embedding_text", "")
+        value = get_allowed_field_value(
+            source=source,
+            embedding_text=embedding_text,
+            field_key=field_key,
+        )
+
+        if value is None or value == "" or value == "미입력":
+            continue
+
+        if field_key.startswith("evaluation"):
+            return EVALUATION_SORT_SCORE.get(str(value).strip())
+
+        number_value = to_number(value)
+
+        if number_value is not None:
+            return number_value
+
+        return str(value)
+
+    return None
+
+
+def sort_hits_by_task_sort(hits: list[dict], sort: dict | None) -> list[dict]:
+    """
+    직원 단위로 정렬한 뒤 limit에 해당하는 직원들의 hit만 남긴다.
+    """
+
+    if not sort:
+        return hits
+
+    field_key = sort.get("field")
+
+    if field_key not in FIELD_RULES:
+        return hits
+
+    grouped_hits = {}
+
+    for hit in hits:
+        employee_id = hit.get("_source", {}).get("employee_id")
+
+        if not employee_id:
+            continue
+
+        grouped_hits.setdefault(employee_id, []).append(hit)
+
+    sortable_items = []
+
+    for employee_id, employee_hits in grouped_hits.items():
+        sort_value = get_sort_value_from_hits(employee_hits, field_key)
+
+        if sort_value is None:
+            continue
+
+        sortable_items.append(
+            {
+                "employee_id": employee_id,
+                "sort_value": sort_value,
+                "hits": employee_hits,
+            }
+        )
+
+    if not sortable_items:
+        return hits
+
+    reverse = sort.get("order", "desc") != "asc"
+    sortable_items = sorted(
+        sortable_items,
+        key=lambda item: item["sort_value"],
+        reverse=reverse,
+    )
+
+    limit = int(sort.get("limit") or len(sortable_items))
+    selected_employee_ids = {
+        item["employee_id"]
+        for item in sortable_items[:limit]
+    }
+
+    return [
+        hit
+        for hit in hits
+        if hit.get("_source", {}).get("employee_id") in selected_employee_ids
+    ]
+
+
 def has_non_org_filters(filters: list[dict]) -> bool:
     """
     department/team/position 외의 추가 조건이 있는지 확인한다.
@@ -662,7 +831,7 @@ def process_task(
 ) -> dict:
     
     #task 처리 시간 측정 시작
-    task_start_time = time.perf_counter()
+    # task_start_time = time.perf_counter()
     #task에서 의도 출력
     intent = task.get("intent", "unknown")
     requested_employee_collection = is_employee_collection_query(original_question)
@@ -674,7 +843,8 @@ def process_task(
         if intent == "single_lookup":
             intent = "condition_search"
 
-    print("[TIME] process_task start:", intent)
+    # print("[TIME] process_task start:", intent)
+
 
     # LLM이 추출한 조직 값은 반드시 코드의 조직 정책 목록으로 다시 검증한다.
     task = normalize_task_org_values(task)
@@ -722,22 +892,28 @@ def process_task(
         )
 
     task["filters"] = filters
+    sort = task.get("sort")
+    sort_fields = [
+        sort.get("field")
+    ] if isinstance(sort, dict) and sort.get("field") in FIELD_RULES else []
+
 
     target_fields = [
         field
         for field in task.get("target_fields", [])
         if field in FIELD_RULES
     ]
+    target_fields = unique_keep_order(target_fields + sort_fields)
 
     # filters에서 권한 판단에 필요한 field 목록을 꺼낸다.
     filter_fields = get_filter_fields(filters)
 
     if intent == "unknown" or not target_fields:
         # 이 task는 조건에 맞지 않아 처리하지 않고 건너뛴다.
-        print(
-            "[TIME] process_task에서 무시됨:",
-            f"{time.perf_counter() - task_start_time:.3f}s",
-        )
+        # print(
+        #     "[TIME] process_task에서 무시됨:",
+        #     f"{time.perf_counter() - task_start_time:.3f}s",
+        # )
         return {
             "answer": COMMON_ERROR_MESSAGE,
             "sources": [],
@@ -801,7 +977,7 @@ def process_task(
                 task["employee_name"] = guessed_name
 
     # 답변 필드뿐 아니라 조건 필드까지 포함해서 필요한 권한 레벨을 계산한다.
-    search_related_fields = unique_keep_order(target_fields + filter_fields)
+    search_related_fields = unique_keep_order(target_fields + filter_fields + sort_fields)
     # target_fields는 사용자에게 보여줄 필드, filter_fields는 검색 조건으로 필요한 필드다. 둘 다 권한 판단에 필요하다.
 
     # required_level은 이 task를 처리하기 위해 필요한 권한 레벨이다. 검색 관련 필드 중에서 가장 높은 레벨이 기준이 된다. 검색 관련 필드가 없으면 1레벨로 간주한다(기본 정보는 모두에게 허용된다고 가정).
@@ -829,10 +1005,10 @@ def process_task(
 
     # 조건 필드 권한이 없으면 검색 자체를 막는다. 조건 검색은 조건값 존재 여부도 정보가 될 수 있다.
     if denied_filter_fields:
-        print(
-            "[TIME] process_task denied_filter:",
-            f"{time.perf_counter() - task_start_time:.3f}s",
-        )
+        # print(
+        #     "[TIME] process_task denied_filter:",
+        #     f"{time.perf_counter() - task_start_time:.3f}s",
+        # )
         return {
             "answer": PERMISSION_DENIED_MESSAGE,
             "sources": [],
@@ -847,10 +1023,10 @@ def process_task(
         }
 
     if not answer_fields:
-        print(
-            "[TIME] process_task denied_answer:",
-            f"{time.perf_counter() - task_start_time:.3f}s",
-        )
+        # print(
+        #     "[TIME] process_task denied_answer:",
+        #     f"{time.perf_counter() - task_start_time:.3f}s",
+        # )
         return {
             "answer": PERMISSION_DENIED_MESSAGE,
             "sources": [],
@@ -871,7 +1047,7 @@ def process_task(
     # search_permission_level = 검색할 때 적용할 권한 레벨
 
     allowed_fields = list(answer_fields)
-    context_fields = unique_keep_order(answer_fields + allowed_filter_fields)
+    context_fields = unique_keep_order(answer_fields + allowed_filter_fields + sort_fields)
 
     if intent in {"single_lookup", "employee_list", "employee_count", "condition_search"}:
         if "employee" not in allowed_fields:
@@ -889,7 +1065,7 @@ def process_task(
     accessible_indices = ACCESSIBLE_INDICES.get(search_permission_level, [])
 
     # 답변 필드와 허용된 조건 필드가 들어 있는 인덱스만 검색 대상으로 선택한다.
-    search_fields = unique_keep_order(answer_fields + allowed_filter_fields)
+    search_fields = unique_keep_order(answer_fields + allowed_filter_fields + sort_fields)
 
     # indices는 실제 검색에 사용할 인덱스 목록이다. 
     indices = select_indices_by_fields(
@@ -912,7 +1088,7 @@ def process_task(
 
         # 직원 수 질문은 검색 결과 size에 의존하지 않고 OpenSearch count로 계산한다.
     if intent == "employee_count":
-        count_start_time = time.perf_counter()
+        # count_start_time = time.perf_counter()
 
         count = count_employees_by_conditions(
             permission_level=search_permission_level,
@@ -929,14 +1105,14 @@ def process_task(
         if denied_message:
             answer = f"{answer}\n\n{denied_message}"
 
-        print(
-            "[TIME] employee_count:",
-            f"{time.perf_counter() - count_start_time:.3f}s",
-        )
-        print(
-            "[TIME] process_task total:",
-            f"{time.perf_counter() - task_start_time:.3f}s",
-        )
+        # print(
+        #     "[TIME] employee_count:",
+        #     f"{time.perf_counter() - count_start_time:.3f}s",
+        # )
+        # print(
+        #     "[TIME] process_task total:",
+        #     f"{time.perf_counter() - task_start_time:.3f}s",
+        # )
 
         return {
             "answer": answer,
@@ -953,7 +1129,7 @@ def process_task(
 
     # 카테고리 목록 질문은 hybrid 검색보다 전체 기본 인덱스 집계가 더 정확하다.
     if intent == "category_list":
-        category_start_time = time.perf_counter()
+        # category_start_time = time.perf_counter()
         answers = [
             build_category_answer(field, search_permission_level)
             for field in answer_fields
@@ -969,14 +1145,14 @@ def process_task(
         if denied_message:
             answer = f"{answer}\n\n{denied_message}"
 
-        print(
-            "[TIME] category_list:",
-            f"{time.perf_counter() - category_start_time:.3f}s",
-        )
-        print(
-            "[TIME] process_task total:",
-            f"{time.perf_counter() - task_start_time:.3f}s",
-        )
+        # print(
+        #     "[TIME] category_list:",
+        #     f"{time.perf_counter() - category_start_time:.3f}s",
+        # )
+        # print(
+        #     "[TIME] process_task total:",
+        #     f"{time.perf_counter() - task_start_time:.3f}s",
+        # )
 
         return {
             "answer": answer,
@@ -999,8 +1175,9 @@ def process_task(
         and (task.get("department") or task.get("team") or task.get("position"))
         and set(answer_fields) == {"employee"}
         and not has_non_org_filters(filters)
+        and not sort
     ):
-        direct_search_start_time = time.perf_counter()
+        # direct_search_start_time = time.perf_counter()
 
         # 직접 검색 로직
         search_hits = search_employees_by_conditions(
@@ -1008,7 +1185,7 @@ def process_task(
             department=task.get("department"),
             team=task.get("team"),
             position=task.get("position"),
-            size=50,
+            size=10000,
         )
 
         # 실제 사용자에게 보여줄 답변 문자열로 변환한다. 
@@ -1016,31 +1193,84 @@ def process_task(
             hits=search_hits,
             allowed_fields=allowed_fields,
         )
-        print(
-            "[TIME] direct_employee_search:",
-            f"{time.perf_counter() - direct_search_start_time:.3f}s",
+        # print(
+        #     "[TIME] direct_employee_search:",
+        #     f"{time.perf_counter() - direct_search_start_time:.3f}s",
+        # )
+
+    # 필터/정렬이 있는 조건 검색은 유사도 상위 50개가 아니라 전체 후보를 조회한다.
+    elif intent in {"condition_search", "employee_list"} and (filters or sort):
+        filter_indices = select_indices_by_fields(
+            accessible_indices=accessible_indices,
+            allowed_fields=unique_keep_order(filter_fields + sort_fields),
         )
+
+        search_hits = search_employees_by_filter_conditions(
+            indices=filter_indices or indices,
+            filters=filters,
+            size=10000,
+        )
+
+        search_hits = filter_hits_by_filters(
+            hits=search_hits,
+            filters=filters,
+        )
+
+        matched_employee_ids = unique_keep_order(
+            [
+                hit.get("_source", {}).get("employee_id")
+                for hit in search_hits
+                if hit.get("_source", {}).get("employee_id")
+            ]
+        )
+
+        if matched_employee_ids:
+            search_hits = search_hits_by_employee_ids(
+                indices=indices,
+                employee_ids=matched_employee_ids,
+                size=10000,
+            )
+
+        search_hits = filter_hits_with_answer_values(
+            hits=search_hits,
+            answer_fields=answer_fields,
+        )
+        search_hits = sort_hits_by_task_sort(search_hits, sort)
+
+        if not search_hits:
+            answer = NO_SEARCH_RESULT_MESSAGE
+        else:
+            answer = format_allowed_hits_answer(
+                hits=search_hits,
+                allowed_fields=allowed_fields,
+            )
 
     # 그 외 단일 조회/복합 조건 검색은 hybrid 검색 후 코드에서 조건을 재검증한다.
     else:
-        hybrid_start_time = time.perf_counter()
+        # hybrid_start_time = time.perf_counter()
+
+        search_employee_name = None
+
+        if intent == "single_lookup":
+            search_employee_name = task.get("employee_name")
         
         # BM25 검색과 벡터 검색을 각각 수행한 뒤, RRF 방식으로 결과를 병합한다.
         search_hits = search_hybrid(
             question=task_question,
             permission_level=search_permission_level,
             employee_id=search_employee_id,
-            employee_name=task.get("employee_name"),
+            employee_name=search_employee_name,
             extract_name=False,
             size=50,
             indices=indices,
+            filters=filters,
         )
-        print(
-            "[TIME] search_hybrid call:",
-            f"{time.perf_counter() - hybrid_start_time:.3f}s",
-        )
+        # print(
+        #     "[TIME] search_hybrid call:",
+        #     f"{time.perf_counter() - hybrid_start_time:.3f}s",
+        # )
 
-        filter_start_time = time.perf_counter()
+        # filter_start_time = time.perf_counter()
 
         # hybrid 검색 결과를 employee_id 기준으로 묶은 뒤 filters 조건을 후처리한다.
         # 같은 직원의 정보가 여러 인덱스/문서에 나뉘어 있을 수 있으므로, 문서 하나가 아니라 직원 단위로 조건을 만족하는지 판단한다.
@@ -1054,12 +1284,13 @@ def process_task(
             hits=search_hits,
             answer_fields=answer_fields,
         )
-        print(
-            "[TIME] filter_hits:",
-            f"{time.perf_counter() - filter_start_time:.3f}s",
-            "hits:",
-            len(search_hits),
-        )
+        search_hits = sort_hits_by_task_sort(search_hits, sort)
+        # print(
+        #     "[TIME] filter_hits:",
+        #     f"{time.perf_counter() - filter_start_time:.3f}s",
+        #     "hits:",
+        #     len(search_hits),
+        # )
 
         if not search_hits:
             answer = NO_SEARCH_RESULT_MESSAGE
@@ -1079,16 +1310,16 @@ def process_task(
                 allowed_fields=allowed_fields,
             )
         else:
-            context_start_time = time.perf_counter()
+            # context_start_time = time.perf_counter()
             context = build_context(
                 search_hits,
                 task_question,
                 allowed_fields=context_fields,
             )
-            print(
-                "[TIME] build_context:",
-                f"{time.perf_counter() - context_start_time:.3f}s",
-            )
+            # print(
+            #     "[TIME] build_context:",
+            #     f"{time.perf_counter() - context_start_time:.3f}s",
+            # )
 
             answer = generate_answer(
                 question=task_question,
@@ -1098,19 +1329,19 @@ def process_task(
     if denied_message:
         answer = f"{answer}\n\n{denied_message}"
 
-    sources_start_time = time.perf_counter()
+    # sources_start_time = time.perf_counter()
     sources = make_sources(
-        search_hits,
+        limit_hits_by_employee_count(search_hits),
         allowed_fields=allowed_fields,
     )
-    print(
-        "[TIME] make_sources:",
-        f"{time.perf_counter() - sources_start_time:.3f}s",
-    )
-    print(
-        "[TIME] process_task total:",
-        f"{time.perf_counter() - task_start_time:.3f}s",
-    )
+    # print(
+    #     "[TIME] make_sources:",
+    #     f"{time.perf_counter() - sources_start_time:.3f}s",
+    # )
+    # print(
+    #     "[TIME] process_task total:",
+    #     f"{time.perf_counter() - task_start_time:.3f}s",
+    # )
 
     return {
         "answer": answer,
