@@ -952,8 +952,12 @@ def normalize_filters(raw_filters) -> list[dict]:
             continue
 
         # =========================
-        # 7. 부서/팀/직책 값 검증
+        # 7. 이름/부서/팀/직급/직책 값 검증
         # =========================
+
+        # employee_name 필터에 직급/조직 값이 들어오면 이름 조건으로 쓰지 않는다.
+        if field == "employee_name" and value in DEPARTMENTS + TEAMS + JOB_GRADES + POSITIONS:
+            continue
 
         # department 필터라면 value가 실제 부서 목록에 있어야 한다.
         if field == "department" and value not in DEPARTMENTS:

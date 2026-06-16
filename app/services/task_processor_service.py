@@ -17,6 +17,7 @@ from app.services.hybrid_search_service import (
     count_employees_by_conditions,
     employee_name_exists,
     filter_hits_with_answer_values,
+    find_employee_name_in_question,
     get_allowed_field_value,
     get_category_values,
     make_sources,
@@ -213,6 +214,9 @@ def sanitize_filters(filters: list[dict]) -> list[dict]:
 
         if op not in allowed_ops:
             op = "eq"
+
+        if field == "employee_name" and value in DEPARTMENTS + TEAMS + JOB_GRADES + POSITIONS:
+            continue
 
         if field == "department" and value not in DEPARTMENTS:
             continue
@@ -1018,7 +1022,7 @@ def process_task(
         and not requested_employee_collection
         and not bool(task.get("is_self", False))
     ):
-        if not task.get("employee_name") and not task.get("employee_id"):
+        if not task.get("employee_name") and not task.get("employee_id") and not task.get("job_grade"):
             guessed_name = extract_employee_name(original_question)
 
             if guessed_name:
@@ -1030,6 +1034,7 @@ def process_task(
         and not filters
         and not task.get("employee_name")
         and not task.get("employee_id")
+        and not task.get("job_grade")
     ):
         guessed_name = extract_employee_name(original_question)
 
@@ -1052,9 +1057,16 @@ def process_task(
 
     is_self = bool(task.get("is_self", False))
 
+    actual_employee_name = find_employee_name_in_question(original_question)
+
+    if actual_employee_name:
+        task["employee_name"] = actual_employee_name
+    elif task.get("employee_name") and task.get("job_grade") and not employee_name_exists(task["employee_name"]):
+        task["employee_name"] = None
+
     # 단일 직원 조회에서 LLM이 이름을 놓친 경우에만 정규식 기반 이름 추출로 보완한다.
     if intent == "single_lookup" and not requested_employee_collection and not is_self:
-        if not task.get("employee_name") and not task.get("employee_id"):
+        if not task.get("employee_name") and not task.get("employee_id") and not task.get("job_grade"):
             guessed_name = extract_employee_name(original_question)
 
             if guessed_name:
@@ -1065,6 +1077,7 @@ def process_task(
     should_validate_employee_name = (
         intent == "single_lookup"
         and code_extracted_name
+        and not actual_employee_name
         and not requested_employee_collection
         and not is_self
         and not task.get("employee_id")

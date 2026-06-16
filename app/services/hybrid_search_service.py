@@ -1225,6 +1225,57 @@ def employee_name_exists(employee_name: str) -> bool:
     return int(total or 0) > 0
 
 
+_employee_name_cache: list[str] | None = None
+
+
+def get_employee_names() -> list[str]:
+    """
+    hr_basic_1에 있는 실제 직원명 목록을 가져온다.
+    이름 추측보다 실제 직원명 매칭을 우선하기 위한 캐시다.
+    """
+
+    global _employee_name_cache
+
+    if _employee_name_cache is not None:
+        return _employee_name_cache
+
+    query = {
+        "size": 10000,
+        "_source": ["employee_name"],
+        "query": {"match_all": {}},
+    }
+
+    response = client.search(index="hr_basic_1", body=query)
+    names = []
+
+    for hit in response.get("hits", {}).get("hits", []):
+        name = hit.get("_source", {}).get("employee_name")
+
+        if name and name not in names:
+            names.append(name)
+
+    _employee_name_cache = sorted(names, key=len, reverse=True)
+
+    return _employee_name_cache
+
+
+def find_employee_name_in_question(question: str) -> str | None:
+    """
+    질문 원문에 실제 직원명이 포함되어 있으면 그 이름을 반환한다.
+    """
+
+    if not question:
+        return None
+
+    compact_question = re.sub(r"\s+", "", question)
+
+    for name in get_employee_names():
+        if name and name in compact_question:
+            return name
+
+    return None
+
+
 def get_department_list(permission_level: int) -> list[str]:
     """
     조회 가능한 부서 목록을 중복 제거해서 반환한다.

@@ -280,6 +280,9 @@ def extract_employee_name(question: str) -> str | None:
     # 조건 표현이 남아 있으면 이름이 아니다.
     # 예: "퇴사한", "입사자", "계약직" 같은 말은 직원명이 아님
     not_name_fragments = [
+        "입사",
+        "퇴사",
+        "퇴직",
         "입사한",
         "퇴사한",
         "퇴직한",
@@ -310,6 +313,7 @@ def extract_employee_name(question: str) -> str | None:
         "무엇",
         "어디",
         "어떻게",
+        "언제",
         "누구야",
         "누구",
         "그리고",

@@ -196,6 +196,51 @@ def has_memory_applicable_keyword(question: str) -> bool:
     return any(keyword in compact_question for keyword in keywords)
 
 
+def is_condition_or_collection_question(question: str) -> bool:
+    """
+    직원 1명의 후속 정보가 아니라 조건/목록 검색으로 봐야 하는 질문인지 판단한다.
+    이런 질문에는 이전 employee_id/name을 붙이면 검색 범위가 잘못 좁아진다.
+    """
+
+    if not question:
+        return False
+
+    compact_question = compact_text(question)
+
+    keywords = [
+        "계약직",
+        "정규직",
+        "입사한",
+        "입사자",
+        "퇴사한",
+        "퇴직한",
+        "퇴사자",
+        "퇴직자",
+        "성과",
+        "성과점수",
+        "평가",
+        "고과",
+        "직원",
+        "직원들",
+        "사원",
+        "사원들",
+        "사람",
+        "사람들",
+        "몇명",
+        "인원",
+        "인원수",
+        "명수",
+        "목록",
+        "리스트",
+        "종류",
+        "찾아줘",
+        "검색",
+        "조회",
+    ]
+
+    return any(keyword in compact_question for keyword in keywords)
+
+
 def remove_followup_reference(question: str) -> str:
     """
     후속 질문의 대명사 표현을 제거한다.
@@ -256,9 +301,10 @@ def resolve_question_with_memory(question: str, requester_employee_id: str) -> s
     if has_explicit_target(question):
         return question
 
-    # 후속 질문도 아니고 HR 조회 항목도 없으면 이전 대상을 붙일 근거가 없다.
-    # 예: "고마워", "다시 설명해줘" 같은 일반 문장
-    if not is_followup_question(question) and not has_memory_applicable_keyword(question):
+    # 명시적인 후속 질문이 아니면 이전 대상을 붙일 근거가 없다.
+    # HR 키워드만 보고 memory를 붙이면 "2024년도에 입사한 계약직" 같은 조건 검색이
+    # 이전 employee_id로 잘못 좁아질 수 있다.
+    if not is_followup_question(question):
         return question
 
     # conversation_memory에서 requester_employee_id로 기억된 대상을 가져온다.
@@ -273,9 +319,6 @@ def resolve_question_with_memory(question: str, requester_employee_id: str) -> s
         or memory.get("last_employee_id")
     )
 
-    if employee_target:
-        return f"{employee_target} {cleaned_question}"
-
     # 이전에 특정 조직을 조회했다면 그 조직을 이번 질문의 대상으로 붙인다.
     # 예: 이전 "채용팀 직원 알려줘" 이후 "계약직도 알려줘" -> "채용팀 계약직도 알려줘"
     org_target = (
@@ -283,6 +326,17 @@ def resolve_question_with_memory(question: str, requester_employee_id: str) -> s
         or memory.get("last_department")
         or memory.get("last_position")
     )
+
+    # 조건/목록 검색 질문에는 직원 1명 기억을 붙이지 않는다.
+    # 조직 기억이 있을 때만 조직 범위의 후속 조건 검색으로 해석한다.
+    if is_condition_or_collection_question(question):
+        if org_target:
+            return f"{org_target} {cleaned_question}"
+
+        return question
+
+    if employee_target:
+        return f"{employee_target} {cleaned_question}"
 
     if org_target:
         return f"{org_target} {cleaned_question}"
