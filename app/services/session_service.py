@@ -1,4 +1,4 @@
-from app.services.org_policy_service import DEPARTMENTS, POSITIONS, TEAMS
+from app.services.org_policy_service import DEPARTMENTS, JOB_GRADES, POSITIONS, TEAMS
 from app.services.question_service import (
     compact_text,
     extract_employee_id,
@@ -82,8 +82,8 @@ def has_explicit_target(question: str) -> bool:
     if employee_name and (employee_name not in NOT_TARGET_NAMES):
         return True
 
-    #compact_question = 공백 제거된 질문 / DEPARTMENTS, TEAMS, POSITIONS에 있는 값이 compact_question에 하나라도 있으면 True, 없으면 False
-    for value in DEPARTMENTS + TEAMS + POSITIONS:
+    #compact_question = 공백 제거된 질문 / DEPARTMENTS, TEAMS, JOB_GRADES, POSITIONS에 있는 값이 compact_question에 하나라도 있으면 True, 없으면 False
+    for value in DEPARTMENTS + TEAMS + JOB_GRADES + POSITIONS:
         if value in compact_question:
             return True
 

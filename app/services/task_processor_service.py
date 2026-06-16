@@ -32,6 +32,7 @@ from app.services.query_policy_service import (
 from app.services.org_policy_service import (
     DEPARTMENTS,
     TEAMS,
+    JOB_GRADES,
     POSITIONS,
 )
 
@@ -97,6 +98,9 @@ def build_employee_count_answer(task: dict, count: int) -> str:
     if task.get("team"):
         conditions.append(task["team"])
 
+    if task.get("job_grade"):
+        conditions.append(task["job_grade"])
+
     if task.get("position"):
         conditions.append(task["position"])
 
@@ -116,6 +120,7 @@ def normalize_task_org_values(task: dict) -> dict:
 
     raw_department = normalized_task.get("department")
     raw_team = normalized_task.get("team")
+    raw_job_grade = normalized_task.get("job_grade")
     raw_position = normalized_task.get("position")
 
     normalized_task["department"] = (
@@ -128,6 +133,12 @@ def normalize_task_org_values(task: dict) -> dict:
     normalized_task["team"] = (
         raw_team
         if raw_team in TEAMS
+        else None
+    )
+
+    normalized_task["job_grade"] = (
+        raw_job_grade
+        if raw_job_grade in JOB_GRADES
         else None
     )
 
@@ -146,7 +157,7 @@ def sanitize_filters(filters: list[dict]) -> list[dict]:
 
     중요:
     - FIELD_RULES에 없는 field는 버린다.
-    - department/team/position은 실제 조직 정책 목록에 있는 값만 허용한다.
+    - department/team/job_grade/position은 실제 정책 목록에 있는 값만 허용한다.
     - 알 수 없는 op는 eq로 낮춘다.
     """
 
@@ -180,6 +191,9 @@ def sanitize_filters(filters: list[dict]) -> list[dict]:
             continue
 
         if field == "team" and value not in TEAMS:
+            continue
+
+        if field == "job_grade" and value not in JOB_GRADES:
             continue
 
         if field == "position" and value not in POSITIONS:
@@ -810,11 +824,11 @@ def sort_hits_by_task_sort(hits: list[dict], sort: dict | None) -> list[dict]:
 
 def has_non_org_filters(filters: list[dict]) -> bool:
     """
-    department/team/position 외의 추가 조건이 있는지 확인한다.
+    department/team/job_grade/position 외의 추가 조건이 있는지 확인한다.
     추가 조건이 있으면 단순 직접 검색이 아니라 hybrid 검색 후 조건 검증 흐름을 탄다.
     """
 
-    org_fields = {"department", "team", "position"}
+    org_fields = {"department", "team", "job_grade", "position"}
 
     for item in filters:
         if item.get("field") not in org_fields:
@@ -877,8 +891,22 @@ def process_task(
         )
 
 
-    # 특정 직원 이름이 있으면 직급은 호칭일 수 있으므로, 이름이 없을 때만 position 필터를 추가한다.
-    # ex) "김민수 대리의 부서 알려줘" -> position이 대리인 조건이지만, "김민수"를 대상으로 검색해야 하므로
+    # 특정 직원 이름이 있으면 직급은 호칭일 수 있으므로, 이름이 없을 때만 job_grade 필터를 추가한다.
+    # ex) "김민수 대리의 부서 알려줘" -> "김민수"를 대상으로 검색해야 하므로
+    if (
+        task.get("job_grade")
+        and not task.get("employee_name")
+        and value_appears_in_question(original_question, task.get("job_grade"))
+    ):
+        filters = add_filter_if_missing(
+            filters=filters,
+            field="job_grade",
+            op="eq",
+            value=task.get("job_grade"),
+        )
+
+    # 특정 직원 이름이 있으면 직책은 호칭일 수 있으므로, 이름이 없을 때만 position 필터를 추가한다.
+    # ex) "김민수 팀장의 부서 알려줘" -> "김민수"를 대상으로 검색해야 하므로
     if (
         task.get("position")
         and not task.get("employee_name")
@@ -1094,6 +1122,7 @@ def process_task(
             permission_level=search_permission_level,
             department=task.get("department"),
             team=task.get("team"),
+            job_grade=task.get("job_grade"),
             position=task.get("position"),
         )
 
@@ -1169,10 +1198,10 @@ def process_task(
 
     search_hits = []
 
-    # 조직/직책만 묻는 단순 직원 목록은 직접 조건 검색.
+    # 조직/직급/직책만 묻는 단순 직원 목록은 직접 조건 검색.
     if (
         intent in {"employee_list", "condition_search"}
-        and (task.get("department") or task.get("team") or task.get("position"))
+        and (task.get("department") or task.get("team") or task.get("job_grade") or task.get("position"))
         and set(answer_fields) == {"employee"}
         and not has_non_org_filters(filters)
         and not sort
@@ -1184,6 +1213,7 @@ def process_task(
             permission_level=search_permission_level,
             department=task.get("department"),
             team=task.get("team"),
+            job_grade=task.get("job_grade"),
             position=task.get("position"),
             size=10000,
         )

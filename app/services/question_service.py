@@ -3,6 +3,7 @@ from app.services.query_policy_service import FIELD_RULES
 from app.services.org_policy_service import (
     DEPARTMENTS,
     TEAMS,
+    JOB_GRADES,
     POSITIONS,
 )
 
@@ -289,6 +290,7 @@ def extract_employee_name(question: str) -> str | None:
     # 실제 조직명/직책명은 이름이 아니다.
     remove_words.extend(DEPARTMENTS)
     remove_words.extend(TEAMS)
+    remove_words.extend(JOB_GRADES)
     remove_words.extend(POSITIONS)
 
     # 중복 제거
@@ -312,7 +314,7 @@ def extract_employee_name(question: str) -> str | None:
     name = match.group()
 
     # 그래도 혹시 남은 조직명/직책명/필드명은 이름으로 인정하지 않는다.
-    invalid_names = set(DEPARTMENTS + TEAMS + POSITIONS)
+    invalid_names = set(DEPARTMENTS + TEAMS + JOB_GRADES + POSITIONS)
     invalid_names.update(remove_words)
 
     if name in invalid_names:

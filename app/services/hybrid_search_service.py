@@ -8,7 +8,13 @@ import torch
 
 from app.services.question_service import extract_employee_name
 from app.services.query_policy_service import FIELD_RULES
-from app.services.org_policy_service import DEPARTMENTS, TEAM_TO_DEPARTMENT
+from app.services.org_policy_service import (
+    DEPARTMENTS,
+    TEAMS,
+    JOB_GRADES,
+    POSITIONS,
+    TEAM_TO_DEPARTMENT,
+)
 
 # =========================
 # 권한별 접근 가능 인덱스 설정
@@ -1233,6 +1239,16 @@ def get_category_values(field_key: str, permission_level: int) -> list[str]:
     if field_key not in {"department", "team", "job_grade", "position"}:
         return []
 
+    policy_values = {
+        "department": DEPARTMENTS,
+        "team": TEAMS,
+        "job_grade": JOB_GRADES,
+        "position": POSITIONS,
+    }
+
+    if field_key in policy_values:
+        return policy_values[field_key]
+
     indices = get_basic_indices(permission_level)
 
     if not indices:
@@ -1346,15 +1362,17 @@ def search_employees_by_conditions(
     permission_level: int,
     department: str | None = None,
     team: str | None = None,
+    job_grade: str | None = None,
     position: str | None = None,
     size: int = 50,
 ):
     """
-    부서/팀/직책 조건으로 직원 목록을 직접 검색한다.
+    부서/팀/직급/직책 조건으로 직원 목록을 직접 검색한다.
 
     예:
     - 인사부 알려줘 -> department="인사부"
     - 백엔드팀 직원 알려줘 -> team="백엔드팀"
+    - 대리 직원 알려줘 -> job_grade="대리"
     - 팀장 누구야 -> position="팀장"
     - 인사부 팀장 알려줘 -> department="인사부", position="팀장"
     """
@@ -1374,6 +1392,11 @@ def search_employees_by_conditions(
     if team:
         filter_conditions.append(
             {"match_phrase": {"embedding_text": f"팀: {team}"}}
+        )
+
+    if job_grade:
+        filter_conditions.append(
+            {"match_phrase": {"job_grade": job_grade}}
         )
 
     if position:
@@ -1536,10 +1559,11 @@ def count_employees_by_conditions(
     permission_level: int,
     department: str | None = None,
     team: str | None = None,
+    job_grade: str | None = None,
     position: str | None = None,
 ) -> int:
     """
-    부서/팀/직책 조건에 맞는 직원 수를 OpenSearch count로 계산한다.
+    부서/팀/직급/직책 조건에 맞는 직원 수를 OpenSearch count로 계산한다.
 
     중요:
     - 직원 수는 목록 size=50으로 세면 안 된다.
@@ -1568,6 +1592,11 @@ def count_employees_by_conditions(
     if team:
         filter_conditions.append(
             {"match_phrase": {"embedding_text": f"팀: {team}"}}
+        )
+
+    if job_grade:
+        filter_conditions.append(
+            {"match_phrase": {"job_grade": job_grade}}
         )
 
     if position:

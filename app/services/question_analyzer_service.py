@@ -18,6 +18,7 @@ from app.services.query_policy_service import (
 from app.services.org_policy_service import (
     DEPARTMENTS,
     TEAMS,
+    JOB_GRADES,
     POSITIONS,
 )
 
@@ -34,6 +35,7 @@ DEFAULT_TASK = {
     "employee_id": None,
     "department": None,
     "team": None,
+    "job_grade": None,
     "position": None,
     "filters": [],
     "sort": None,
@@ -219,6 +221,7 @@ def parse_key_value_analysis(raw_text: str) -> dict:
         "employee_id": to_none(parsed.get("employee_id")),
         "department": to_none(parsed.get("department")),
         "team": to_none(parsed.get("team")),
+        "job_grade": to_none(parsed.get("job_grade")),
         "position": to_none(parsed.get("position")),
         "filters": parse_filters(parsed.get("filters")),
         "sort": None,
@@ -440,7 +443,7 @@ def is_org_alias_text(text: str | None) -> bool:
 
     compact_value = compact_text(str(text))
 
-    if compact_value in DEPARTMENTS or compact_value in TEAMS or compact_value in POSITIONS:
+    if compact_value in DEPARTMENTS or compact_value in TEAMS or compact_value in JOB_GRADES or compact_value in POSITIONS:
         return True
 
     if compact_value.endswith("관련"):
@@ -960,7 +963,11 @@ def normalize_filters(raw_filters) -> list[dict]:
         if field == "team" and value not in TEAMS:
             continue
 
-        # position 필터라면 value가 실제 직급/직책 목록에 있어야 한다.
+        # job_grade 필터라면 value가 실제 직급 목록에 있어야 한다.
+        if field == "job_grade" and value not in JOB_GRADES:
+            continue
+
+        # position 필터라면 value가 실제 직책 목록에 있어야 한다.
         if field == "position" and value not in POSITIONS:
             continue
 
@@ -1015,7 +1022,7 @@ def analyze_question_to_tasks(question: str) -> dict:
 
     prompt = f"""
         너는 한국어 HR RAG API의 질문 분석기다.
-        JSON을 만들지 말고, 아래 key=value 9줄만 반환해라.
+        JSON을 만들지 말고, 아래 key=value 10줄만 반환해라.
         마크다운, 설명, 코드블록, 중괄호, 대괄호를 절대 쓰지 마라.
 
         반환 형식:
@@ -1025,6 +1032,7 @@ def analyze_question_to_tasks(question: str) -> dict:
         employee_id=
         department=
         team=
+        job_grade=
         position=
         filters=
         is_self=
@@ -1093,6 +1101,7 @@ def analyze_question_to_tasks(question: str) -> dict:
         - 계약직 직원 -> filters=contract_type|eq|계약직
         - 인사부 직원 -> department=인사부, filters=department|eq|인사부
         - 백엔드팀 직원 -> team=백엔드팀, filters=team|eq|백엔드팀
+        - 대리 직원 -> job_grade=대리, filters=job_grade|eq|대리
         - 팀장 누구야 -> position=팀장, filters=position|eq|팀장
         - 인사 업무 담당자 누구야 -> department=인사부, filters=department|eq|인사부
 
@@ -1103,6 +1112,7 @@ def analyze_question_to_tasks(question: str) -> dict:
         employee_id=NULL
         department=인사부
         team=NULL
+        job_grade=NULL
         position=NULL
         filters=department|eq|인사부
         is_self=false
@@ -1252,7 +1262,10 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
     # 질문 문장에 실제 팀명이 있는지 찾는다.
     found_team = find_known_value(question, TEAMS)
 
-    # 질문 문장에 실제 직급/직책명이 있는지 찾는다.
+    # 질문 문장에 실제 직급명이 있는지 찾는다.
+    found_job_grade = find_known_value(question, JOB_GRADES)
+
+    # 질문 문장에 실제 직책명이 있는지 찾는다.
     found_position = find_known_value(question, POSITIONS)
 
     # 사용자가 정확한 부서명/팀명이 아니라 별칭처럼 물어볼 수 있다.
@@ -1378,12 +1391,13 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
         )
 
         # -------------------------
-        # 3-3. 부서/팀/직급 값 보정
+        # 3-3. 부서/팀/직급/직책 값 보정
         # -------------------------
 
-        # LLM이 추출한 부서/팀/직급 값을 가져온다.
+        # LLM이 추출한 부서/팀/직급/직책 값을 가져온다.
         raw_department = task.get("department")
         raw_team = task.get("team")
+        raw_job_grade = task.get("job_grade")
         raw_position = task.get("position")
 
         # LLM이 준 department가 실제 DEPARTMENTS 목록에 있으면 사용한다.
@@ -1401,6 +1415,14 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
             if raw_team in TEAMS and value_appears_in_question(question, raw_team)
             else found_team
         )
+        # LLM이 준 job_grade가 실제 JOB_GRADES 목록에 있으면 사용한다.
+        # 아니면 질문 문장에서 코드로 찾은 found_job_grade를 사용한다.
+        job_grade = (
+            raw_job_grade
+            if raw_job_grade in JOB_GRADES and value_appears_in_question(question, raw_job_grade)
+            else found_job_grade
+        )
+
         # LLM이 준 position이 실제 POSITIONS 목록에 있으면 사용한다.
         # 아니면 질문 문장에서 코드로 찾은 found_position을 사용한다.
         position = (
@@ -1451,14 +1473,31 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
                 value=team,
             )
 
-        # 질문에서 직급/직책이 확인되었고,
-        # 특정 직원 이름을 묻는 질문이 아니면 position 조건을 추가한다.
+        # 질문에서 직급이 확인되었고,
+        # 특정 직원 이름을 묻는 질문이 아니면 job_grade 조건을 추가한다.
         #
         # 예:
-        # "대리 직원 알려줘" -> position 필터 필요
+        # "대리 직원 알려줘" -> job_grade 필터 필요
         #
         # 반대로
         # "김민수 대리의 부서 알려줘"처럼 employee_name이 있으면
+        # job_grade를 조건으로 강하게 걸지 않는다.
+        if job_grade and not task.get("employee_name"):
+            filters = add_filter_if_missing(
+                filters=filters,
+                field="job_grade",
+                op="eq",
+                value=job_grade,
+            )
+
+        # 질문에서 직책이 확인되었고,
+        # 특정 직원 이름을 묻는 질문이 아니면 position 조건을 추가한다.
+        #
+        # 예:
+        # "팀장 직원 알려줘" -> position 필터 필요
+        #
+        # 반대로
+        # "김민수 팀장의 부서 알려줘"처럼 employee_name이 있으면
         # position을 조건으로 강하게 걸지 않는다.
         if position and not task.get("employee_name"):
             filters = add_filter_if_missing(
@@ -1591,6 +1630,7 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
                 "employee_id": employee_id,
                 "department": department,
                 "team": team,
+                "job_grade": job_grade,
                 "position": position,
                 "filters": filters,
                 "sort": sort,
