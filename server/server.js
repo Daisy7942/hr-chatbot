@@ -15,13 +15,16 @@ const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const path = require('path');
 
+// 상위 폴더(dma/)의 .env 파일을 읽어 환경변수로 등록
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+
 const app = express();
 
-// 프론트 서버가 사용할 포트
-const PORT = 3000;
+// 프론트 서버가 사용할 포트 (.env의 FRONT_PORT, 기본 3000)
+const PORT = process.env.FRONT_PORT || 3000;
 
-// 백엔드(FastAPI)가 실제로 떠 있는 주소
-const BACKEND_URL = 'http://localhost:8000';
+// 백엔드(FastAPI) 주소 (.env의 BACKEND_URL, 기본 localhost:8000)
+const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8000';
 
 // ──────────────────────────────────────────────
 // 1. /api/* 요청을 백엔드로 중계
@@ -39,11 +42,13 @@ app.use(
 );
 
 // ──────────────────────────────────────────────
-// 2. 정적 파일 서빙
-//    상위 폴더(dma)에 있는 index.html 등을 브라우저에 응답
-//    server.js는 server/ 폴더에 있고, index.html은 dma/ 루트에 있음
+// 2. index.html 하나만 명시적으로 응답
+//    이전에는 dma/ 전체를 express.static으로 공개해 인사 CSV·백엔드 소스까지 노출됨
+//    공개할 파일이 index.html 하나뿐이므로 그 파일만 / 경로에서 직접 보냄
 // ──────────────────────────────────────────────
-app.use(express.static(path.join(__dirname, '..')));
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'index.html'));
+});
 
 // ──────────────────────────────────────────────
 // 3. 서버 시작
