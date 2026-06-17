@@ -8,7 +8,13 @@ import torch
 
 from app.services.question_service import extract_employee_name
 from app.services.query_policy_service import FIELD_RULES
-from app.services.org_policy_service import DEPARTMENTS, TEAM_TO_DEPARTMENT
+from app.services.org_policy_service import (
+    DEPARTMENTS,
+    TEAMS,
+    JOB_GRADES,
+    POSITIONS,
+    TEAM_TO_DEPARTMENT,
+)
 
 # =========================
 # 권한별 접근 가능 인덱스 설정
@@ -1187,6 +1193,89 @@ def get_basic_indices(permission_level: int) -> list[str]:
     ]
 
 
+def employee_name_exists(employee_name: str) -> bool:
+    """
+    hr_basic_1에서 직원 이름이 실제로 존재하는지 확인한다.
+    이름 존재 여부는 기본 인사정보 기준으로 판단한다.
+    """
+
+    if not employee_name:
+        return False
+
+    query = {
+        "size": 0,
+        "query": {
+            "bool": {
+                "should": [
+                    {"term": {"employee_name.keyword": employee_name}},
+                    {"match_phrase": {"employee_name": employee_name}},
+                    {"match_phrase": {"embedding_text": f"이름: {employee_name}"}},
+                ],
+                "minimum_should_match": 1,
+            }
+        },
+    }
+
+    response = client.search(index="hr_basic_1", body=query)
+    total = response.get("hits", {}).get("total", {})
+
+    if isinstance(total, dict):
+        return int(total.get("value", 0)) > 0
+
+    return int(total or 0) > 0
+
+
+_employee_name_cache: list[str] | None = None
+
+
+def get_employee_names() -> list[str]:
+    """
+    hr_basic_1에 있는 실제 직원명 목록을 가져온다.
+    이름 추측보다 실제 직원명 매칭을 우선하기 위한 캐시다.
+    """
+
+    global _employee_name_cache
+
+    if _employee_name_cache is not None:
+        return _employee_name_cache
+
+    query = {
+        "size": 10000,
+        "_source": ["employee_name"],
+        "query": {"match_all": {}},
+    }
+
+    response = client.search(index="hr_basic_1", body=query)
+    names = []
+
+    for hit in response.get("hits", {}).get("hits", []):
+        name = hit.get("_source", {}).get("employee_name")
+
+        if name and name not in names:
+            names.append(name)
+
+    _employee_name_cache = sorted(names, key=len, reverse=True)
+
+    return _employee_name_cache
+
+
+def find_employee_name_in_question(question: str) -> str | None:
+    """
+    질문 원문에 실제 직원명이 포함되어 있으면 그 이름을 반환한다.
+    """
+
+    if not question:
+        return None
+
+    compact_question = re.sub(r"\s+", "", question)
+
+    for name in get_employee_names():
+        if name and name in compact_question:
+            return name
+
+    return None
+
+
 def get_department_list(permission_level: int) -> list[str]:
     """
     조회 가능한 부서 목록을 중복 제거해서 반환한다.
@@ -1232,6 +1321,16 @@ def get_category_values(field_key: str, permission_level: int) -> list[str]:
 
     if field_key not in {"department", "team", "job_grade", "position"}:
         return []
+
+    policy_values = {
+        "department": DEPARTMENTS,
+        "team": TEAMS,
+        "job_grade": JOB_GRADES,
+        "position": POSITIONS,
+    }
+
+    if field_key in policy_values:
+        return policy_values[field_key]
 
     indices = get_basic_indices(permission_level)
 
@@ -1288,11 +1387,12 @@ def search_employees_by_department_or_team(
 
     indices = get_basic_indices(permission_level)
 
-    print("[DEBUG] 직원 검색 indices:", indices)
-    print("[DEBUG] 원본 검색어:", department_or_team)
 
     if not indices:
         return []
+
+    print("[DEBUG] 직원 검색 indices:", indices)
+    print("[DEBUG] 원본 검색어:", department_or_team)
 
     # =========================
     # 1. 검색어 확장
@@ -1339,6 +1439,7 @@ def search_employees_by_department_or_team(
     hits = response["hits"]["hits"]
 
     print("[DEBUG] 직원 검색 결과 수:", len(hits))
+    print(f"[SEARCH] employee_search hits={len(hits)}")
 
     return hits
 
@@ -1346,15 +1447,17 @@ def search_employees_by_conditions(
     permission_level: int,
     department: str | None = None,
     team: str | None = None,
+    job_grade: str | None = None,
     position: str | None = None,
     size: int = 50,
 ):
     """
-    부서/팀/직책 조건으로 직원 목록을 직접 검색한다.
+    부서/팀/직급/직책 조건으로 직원 목록을 직접 검색한다.
 
     예:
     - 인사부 알려줘 -> department="인사부"
     - 백엔드팀 직원 알려줘 -> team="백엔드팀"
+    - 대리 직원 알려줘 -> job_grade="대리"
     - 팀장 누구야 -> position="팀장"
     - 인사부 팀장 알려줘 -> department="인사부", position="팀장"
     """
@@ -1374,6 +1477,11 @@ def search_employees_by_conditions(
     if team:
         filter_conditions.append(
             {"match_phrase": {"embedding_text": f"팀: {team}"}}
+        )
+
+    if job_grade:
+        filter_conditions.append(
+            {"match_phrase": {"job_grade": job_grade}}
         )
 
     if position:
@@ -1404,6 +1512,7 @@ def search_employees_by_conditions(
     hits = response["hits"]["hits"]
 
     print("[DEBUG] 조건 직원 검색 결과 수:", len(hits))
+    print(f"[SEARCH] condition_employee_search hits={len(hits)}")
 
     return hits
 
@@ -1499,6 +1608,7 @@ def search_employees_by_filter_conditions(
     hits = response["hits"]["hits"]
 
     print("[DEBUG] 필터 조건 검색 결과 수:", len(hits))
+    print(f"[SEARCH] filter_condition_search hits={len(hits)}")
 
     return hits
 
@@ -1536,10 +1646,11 @@ def count_employees_by_conditions(
     permission_level: int,
     department: str | None = None,
     team: str | None = None,
+    job_grade: str | None = None,
     position: str | None = None,
 ) -> int:
     """
-    부서/팀/직책 조건에 맞는 직원 수를 OpenSearch count로 계산한다.
+    부서/팀/직급/직책 조건에 맞는 직원 수를 OpenSearch count로 계산한다.
 
     중요:
     - 직원 수는 목록 size=50으로 세면 안 된다.
@@ -1568,6 +1679,11 @@ def count_employees_by_conditions(
     if team:
         filter_conditions.append(
             {"match_phrase": {"embedding_text": f"팀: {team}"}}
+        )
+
+    if job_grade:
+        filter_conditions.append(
+            {"match_phrase": {"job_grade": job_grade}}
         )
 
     if position:
@@ -1601,6 +1717,7 @@ def count_employees_by_conditions(
     count = int(response.get("count", 0))
 
     print("[DEBUG] 직원 수 count 결과:", count)
+    print(f"[SEARCH] employee_count count={count}")
 
     return count
 
@@ -1853,7 +1970,10 @@ def search_hybrid(
     #     f"{time.perf_counter() - rrf_start_time:.3f}s",
     # )
 
-    # print("[DEBUG] Hybrid RRF hits count:", len(hybrid_hits))
+    print(
+        f"[SEARCH] hybrid bm25={len(bm25_hits)} "
+        f"vector={len(vector_hits)} rrf={len(hybrid_hits)}"
+    )
     # print("[TIME] search_hybrid total:", f"{time.perf_counter() - start_time:.3f}s")
 
     return hybrid_hits

@@ -3,6 +3,7 @@ from app.services.query_policy_service import FIELD_RULES
 from app.services.org_policy_service import (
     DEPARTMENTS,
     TEAMS,
+    JOB_GRADES,
     POSITIONS,
 )
 
@@ -78,6 +79,86 @@ def is_all_employee_query(question: str) -> bool:
     return any(keyword in compact_question for keyword in all_employee_keywords)
 
 
+def extract_name_like_prefix(question: str) -> str | None:
+    """
+    "홍길동 연봉", "없는사람 연봉"처럼 필드명 앞에 붙은 2~4글자 대상 후보를 찾는다.
+    직원 목록 표현과 특정 직원 이름을 구분하기 위한 보조 함수다.
+    """
+
+    if not question:
+        return None
+
+    compact_question = compact_text(question)
+
+    field_keywords = [
+        "사원번호",
+        "사번",
+        "이름",
+        "부서",
+        "팀",
+        "직급",
+        "직책",
+        "이메일",
+        "메일",
+        "전화번호",
+        "연락처",
+        "주소",
+        "연봉",
+        "급여",
+        "평가",
+        "고과",
+        "인사고과",
+    ]
+
+    invalid_prefixes = {
+        "내",
+        "내이름",
+        "내성명",
+        "나의",
+        "나의이름",
+        "나의성명",
+        "본인",
+        "본인이름",
+        "본인성명",
+        "우리",
+        "제이름",
+        "제성명",
+        "저의이름",
+        "저의성명",
+        "전체",
+        "모든",
+        "전부",
+        "성과",
+        "평가",
+        "고과",
+        "좋은",
+        "높은",
+        "낮은",
+    }
+
+    for keyword in field_keywords:
+        index = compact_question.find(keyword)
+
+        if index <= 0:
+            continue
+
+        prefix = compact_question[:index]
+        prefix = re.sub(r"(은|는|이|가|을|를|의|님|씨)+$", "", prefix)
+
+        if not re.fullmatch(r"[가-힣]{2,4}", prefix):
+            continue
+
+        if prefix in invalid_prefixes:
+            continue
+
+        if prefix in DEPARTMENTS or prefix in TEAMS or prefix in JOB_GRADES or prefix in POSITIONS:
+            continue
+
+        return prefix
+
+    return None
+
+
 def is_employee_collection_query(question: str) -> bool:
     """
     질문이 특정 직원 1명이 아니라 직원 목록/집합을 대상으로 하는지 판단한다.
@@ -87,6 +168,9 @@ def is_employee_collection_query(question: str) -> bool:
         return False
 
     compact_question = compact_text(question)
+
+    if extract_name_like_prefix(question):
+        return False
 
     if is_all_employee_query(question):
         return True
@@ -177,6 +261,11 @@ def extract_employee_name(question: str) -> str | None:
     if not question:
         return None
 
+    name_like_prefix = extract_name_like_prefix(question)
+
+    if name_like_prefix:
+        return name_like_prefix
+
     # "퇴사한 사람", "입사한 직원" 같은 질문은 특정 1명 조회가 아니다.
     # 이런 경우 이름을 억지로 뽑으면 "년퇴사한" 같은 오탐이 생긴다.
     if is_employee_collection_query(question):
@@ -191,6 +280,9 @@ def extract_employee_name(question: str) -> str | None:
     # 조건 표현이 남아 있으면 이름이 아니다.
     # 예: "퇴사한", "입사자", "계약직" 같은 말은 직원명이 아님
     not_name_fragments = [
+        "입사",
+        "퇴사",
+        "퇴직",
         "입사한",
         "퇴사한",
         "퇴직한",
@@ -221,6 +313,7 @@ def extract_employee_name(question: str) -> str | None:
         "무엇",
         "어디",
         "어떻게",
+        "언제",
         "누구야",
         "누구",
         "그리고",
@@ -243,6 +336,15 @@ def extract_employee_name(question: str) -> str | None:
         "구성원",
         "사람들",
         "사람",
+        "상사들",
+        "상사",
+        "상급자",
+        "윗사람",
+        "직속상사",
+        "직속상관",
+        "보고라인",
+        "보고체계",
+        "결재라인",
         "목록",
         "리스트",
         "종류",
@@ -289,6 +391,7 @@ def extract_employee_name(question: str) -> str | None:
     # 실제 조직명/직책명은 이름이 아니다.
     remove_words.extend(DEPARTMENTS)
     remove_words.extend(TEAMS)
+    remove_words.extend(JOB_GRADES)
     remove_words.extend(POSITIONS)
 
     # 중복 제거
@@ -301,7 +404,10 @@ def extract_employee_name(question: str) -> str | None:
 
     # 끝에 붙은 조사/호칭 제거
     # 예: "오민호는" -> "오민호"
-    cleaned = re.sub(r"(은|는|이|가|을|를|의|님|씨|\?)+$", "", cleaned)
+    stripped = re.sub(r"(은|는|이|가|을|를|의|님|씨|\?)+$", "", cleaned)
+
+    if len(stripped) >= 2:
+        cleaned = stripped
 
     # 남은 값에서 한글 2~4글자를 이름 후보로 본다.
     match = re.search(r"[가-힣]{2,4}", cleaned)
@@ -312,7 +418,7 @@ def extract_employee_name(question: str) -> str | None:
     name = match.group()
 
     # 그래도 혹시 남은 조직명/직책명/필드명은 이름으로 인정하지 않는다.
-    invalid_names = set(DEPARTMENTS + TEAMS + POSITIONS)
+    invalid_names = set(DEPARTMENTS + TEAMS + JOB_GRADES + POSITIONS)
     invalid_names.update(remove_words)
 
     if name in invalid_names:
