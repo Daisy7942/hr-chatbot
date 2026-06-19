@@ -107,7 +107,7 @@ FIELD_RULES = {
 
     # 샘플에서 hr_basic_1 embedding_text에 보였던 필드
     # 단, 민감도는 required_level로 따로 관리한다.
-    "gender": {
+       "gender": {
         "label": "성별",
         "doc_type": "basic",
         "index_level": 1,

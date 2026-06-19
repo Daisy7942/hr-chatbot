@@ -17,6 +17,11 @@ from app.services.question_service import (
     is_employee_collection_query,
     is_self_question,
 )
+from app.services.question_analyzer_service import (
+    is_self_placeholder_filter_value,
+    is_self_placeholder_name,
+    is_limit_placeholder_name,
+)
 from app.services.hybrid_search_service import (
     build_context,
     count_employees_by_conditions,
@@ -198,6 +203,9 @@ def sanitize_filters(filters: list[dict]) -> list[dict]:
         if field not in FIELD_RULES:
             continue
 
+        if field == "employee":
+            continue
+
         if value is None or value == "":
             continue
 
@@ -231,6 +239,20 @@ def sanitize_filters(filters: list[dict]) -> list[dict]:
         )
 
     return safe_filters
+
+
+def remove_self_placeholder_filters(filters: list[dict], is_self: bool) -> list[dict]:
+    if not is_self:
+        return filters
+
+    return [
+        item
+        for item in filters
+        if not is_self_placeholder_filter_value(
+            item.get("field"),
+            item.get("value"),
+        )
+    ]
 
 
 def remove_hallucinated_org_values(task: dict, original_question: str) -> dict:
@@ -771,16 +793,12 @@ def sort_hits_by_task_sort(hits: list[dict], sort: dict | None) -> list[dict]:
     )
 
     limit = int(sort.get("limit") or len(sortable_items))
-    selected_employee_ids = {
-        item["employee_id"]
-        for item in sortable_items[:limit]
-    }
+    sorted_hits = []
 
-    return [
-        hit
-        for hit in hits
-        if hit.get("_source", {}).get("employee_id") in selected_employee_ids
-    ]
+    for item in sortable_items[:limit]:
+        sorted_hits.extend(item["hits"])
+
+    return sorted_hits
 
 
 def has_non_org_filters(filters: list[dict]) -> bool:
@@ -798,6 +816,54 @@ def has_non_org_filters(filters: list[dict]) -> bool:
     return False
 
 
+def extract_result_limit(question: str) -> int | None:
+    """
+    "5명만", "5개만", "상위 5명"처럼 사용자가 요청한 출력 개수를 추출한다.
+    검색 범위를 줄이는 용도가 아니라 최종 답변/sources 출력 개수 제한에만 사용한다.
+    """
+
+    if not question:
+        return None
+
+    compact_question = compact_text(question)
+
+    patterns = [
+        r"(\d{1,3})(?:명|개|건)?만",
+        r"(?:상위|하위|최대|최소|앞에서|처음|먼저)(\d{1,3})(?:명|개|건)?",
+        r"(\d{1,3})(?:명|개|건)(?:만)?(?:알려|보여|조회|찾아)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, compact_question)
+
+        if not match:
+            continue
+
+        limit = int(match.group(1))
+
+        if 1 <= limit <= MAX_OUTPUT_EMPLOYEES:
+            return limit
+
+    korean_numbers = {
+        "한": 1,
+        "두": 2,
+        "세": 3,
+        "네": 4,
+        "다섯": 5,
+        "여섯": 6,
+        "일곱": 7,
+        "여덟": 8,
+        "아홉": 9,
+        "열": 10,
+    }
+
+    for word, limit in korean_numbers.items():
+        if f"{word}명만" in compact_question or f"{word}개만" in compact_question:
+            return limit
+
+    return None
+
+
 def process_task(
     task: dict,
     original_question: str,
@@ -805,11 +871,12 @@ def process_task(
     permission_level: int,
 ) -> dict:
     
-    #task 처리 시간 측정 시작
+     #task 처리 시간 측정 시작
     # task_start_time = time.perf_counter()
     #task에서 의도 출력
     intent = task.get("intent", "unknown")
 
+    # 사용자가 "상사/상급자/보고라인" 같은 상사 관계를 물어본 경우
     if is_supervisor_query(original_question):
         return {
             "answer": UNSUPPORTED_SUPERVISOR_MESSAGE,
@@ -825,9 +892,10 @@ def process_task(
                 "is_self": bool(task.get("is_self", False)),
             },
         }
-
+    # 질문이 "직원들/사람들/목록"처럼 여러 직원을 조회하는 질문인지 판단한다.
     requested_employee_collection = is_employee_collection_query(original_question)
 
+    # 특정 직원 1명조회로 오해 하지 않도록 지운다.
     if requested_employee_collection:
         task["employee_name"] = None
         task["employee_id"] = None
@@ -836,6 +904,7 @@ def process_task(
             intent = "condition_search"
 
     # print("[TIME] process_task start:", intent)
+
 
 
     # LLM이 추출한 조직 값은 반드시 코드의 조직 정책 목록으로 다시 검증한다.
@@ -908,6 +977,10 @@ def process_task(
     sort_fields = [
         sort.get("field")
     ] if isinstance(sort, dict) and sort.get("field") in FIELD_RULES else []
+    result_limit = extract_result_limit(original_question)
+
+    if result_limit and isinstance(sort, dict):
+        sort["limit"] = result_limit
 
 
     target_fields = [
@@ -943,6 +1016,18 @@ def process_task(
                 "is_self": bool(task.get("is_self", False)),
             },
         }
+
+    if (
+        is_self_question(original_question)
+        and not requested_employee_collection
+        and (
+            not task.get("employee_name")
+            or is_self_placeholder_name(task.get("employee_name"))
+        )
+        and not task.get("employee_id")
+    ):
+        task["is_self"] = True
+        task["employee_name"] = None
 
     if (
         intent == "single_lookup"
@@ -983,12 +1068,17 @@ def process_task(
         task["is_self"] = True
 
     is_self = bool(task.get("is_self", False))
+    filters = remove_self_placeholder_filters(filters, is_self)
+    task["filters"] = filters
 
     actual_employee_name = find_employee_name_in_question(original_question)
 
-    if actual_employee_name:
+    if actual_employee_name and not task.get("employee_name"):
         task["employee_name"] = actual_employee_name
     elif task.get("employee_name") and task.get("job_grade") and not employee_name_exists(task["employee_name"]):
+        task["employee_name"] = None
+
+    if is_limit_placeholder_name(task.get("employee_name")):
         task["employee_name"] = None
 
     # 단일 직원 조회에서 LLM이 이름을 놓친 경우에만 정규식 기반 이름 추출로 보완한다.
@@ -1243,7 +1333,8 @@ def process_task(
 
     # 조직/직급/직책만 묻는 단순 직원 목록은 직접 조건 검색.
     if (
-        intent in {"employee_list", "condition_search"}
+        not is_self
+        and intent in {"employee_list", "condition_search"}
         and (task.get("department") or task.get("team") or task.get("job_grade") or task.get("position"))
         and set(answer_fields) == {"employee"}
         and not has_non_org_filters(filters)
@@ -1265,6 +1356,7 @@ def process_task(
         answer = format_allowed_hits_answer(
             hits=search_hits,
             allowed_fields=allowed_fields,
+            limit=result_limit or MAX_OUTPUT_EMPLOYEES,
         )
         # print(
         #     "[TIME] direct_employee_search:",
@@ -1272,7 +1364,7 @@ def process_task(
         # )
 
     # 필터/정렬이 있는 조건 검색은 유사도 상위 50개가 아니라 전체 후보를 조회한다.
-    elif intent in {"condition_search", "employee_list"} and (filters or sort):
+    elif not is_self and intent in {"condition_search", "employee_list"} and (filters or sort):
         filter_indices = select_indices_by_fields(
             accessible_indices=accessible_indices,
             allowed_fields=unique_keep_order(filter_fields + sort_fields),
@@ -1316,6 +1408,7 @@ def process_task(
             answer = format_allowed_hits_answer(
                 hits=search_hits,
                 allowed_fields=allowed_fields,
+                limit=result_limit or MAX_OUTPUT_EMPLOYEES,
             )
 
     # 그 외 단일 조회/복합 조건 검색은 hybrid 검색 후 코드에서 조건을 재검증한다.
@@ -1371,16 +1464,19 @@ def process_task(
             answer = format_allowed_hits_answer(
                 hits=search_hits,
                 allowed_fields=allowed_fields,
+                limit=result_limit or MAX_OUTPUT_EMPLOYEES,
             )
         elif intent in {"condition_search", "employee_list"} and filters:
             answer = format_allowed_hits_answer(
                 hits=search_hits,
                 allowed_fields=allowed_fields,
+                limit=result_limit or MAX_OUTPUT_EMPLOYEES,
             )
         elif intent == "condition_search" and (task.get("department") or task.get("team")):
             answer = format_allowed_hits_answer(
                 hits=search_hits,
                 allowed_fields=allowed_fields,
+                limit=result_limit or MAX_OUTPUT_EMPLOYEES,
             )
         else:
             # context_start_time = time.perf_counter()
@@ -1404,7 +1500,10 @@ def process_task(
 
     # sources_start_time = time.perf_counter()
     sources = make_sources(
-        limit_hits_by_employee_count(search_hits),
+        limit_hits_by_employee_count(
+            search_hits,
+            limit=result_limit or MAX_OUTPUT_EMPLOYEES,
+        ),
         allowed_fields=allowed_fields,
     )
     # print(
