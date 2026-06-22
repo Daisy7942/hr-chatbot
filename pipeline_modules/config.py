@@ -8,6 +8,9 @@ from pathlib import Path
 from datetime import date
 from dotenv import load_dotenv
 
+# 부서·직책 같은 조직 기준 데이터는 app과 공통으로 쓰므로 common에서 가져온다.
+from common.hr_master_data import DEPARTMENTS, POSITIONS
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent  # pipeline_modules/ 의 상위 = 프로젝트 루트
 load_dotenv(BASE_DIR / '.env')
@@ -109,7 +112,7 @@ MIN_GPA,          MAX_GPA          = 0.0, 4.5
 MIN_SCORE,        MAX_SCORE        = 0, 100
 MIN_TOEIC,        MAX_TOEIC        = 0, 990
 
-DEPARTMENTS = ['개발부', '인사부', '영업부', '마케팅부', '기획부']
+# DEPARTMENTS 는 common.hr_master_data 에서 가져온다 (위 import 참고)
 
 DEPT_TEAM_MAP = {
     '개발부':   ['백엔드팀', '프론트팀', 'AI팀', '인프라팀'],
@@ -137,7 +140,7 @@ GRADE_LEVEL_MAP = {
     '사장': 3
 }
 
-POSITIONS        = ['팀원', '팀장', '본부장', '대표이사']
+# POSITIONS 는 common.hr_master_data 에서 가져온다 (위 import 참고)
 PERF_GRADES      = ['S', 'A', 'B', 'C', 'D', 'F']
 INSURANCE_VALUES = ['가입', '미가입']
 SUBSIDY_VALUES   = ['해당', '비해당']
