@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>인사데이터 권한기반 챗봇</title>
+  <link rel="stylesheet" href="/style.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3/dist/cdn.min.js"></script>
+  <script defer src="/chatbot.js"></script>
+</head>
+
+<body>
+  <div class="app" x-data="chatbot()">
+
+    <header class="header">
+      <h1>인사데이터 권한기반 챗봇</h1>
+      <span class="badge" x-show="permissionLevel" x-text="`Lv.${permissionLevel}`"></span>
+    </header>
+
+    <div class="id-input">
+      <input
+        type="text"
+        x-model="employeeId"
+        placeholder="사번을 입력하세요 (예: EMP0001)"
+        @keydown.enter="applyEmployeeId()"
+      >
+      <button @click="applyEmployeeId()">적용</button>
+    </div>
+
+    <div class="chat-area" x-ref="chatArea">
+      <template x-for="(msg, index) in messages" :key="index">
+        <div class="message-block" :class="msg.role">
+
+          <div x-show="msg.role === 'user'"
+               class="message message-user"
+               x-text="msg.text"></div>
+
+          <div x-show="msg.role === 'bot'"
+               class="message message-bot"
+               x-text="msg.text"></div>
+
+          <div x-show="msg.role === 'bot' && msg.sources && msg.sources.length > 0"
+               class="sources">
+            <template x-for="indexName in uniqueIndices(msg.sources)" :key="indexName">
+              <div class="source-card">출처: <span x-text="indexName"></span></div>
+            </template>
+          </div>
+
+          <div x-show="msg.role === 'error'" class="message message-error">
+            <div x-text="msg.text"></div>
+            <button @click="retry(msg.question)">다시 시도</button>
+          </div>
+
+        </div>
+      </template>
+
+      <div x-show="loading" class="loading">
+        <span></span><span></span><span></span>
+      </div>
+    </div>
+
+    <div class="chat-input">
+      <input
+        type="text"
+        x-model="question"
+        placeholder="질문을 입력하세요"
+        @keydown.enter="send()"
+        :disabled="loading"
+      >
+      <button @click="send()" :disabled="loading">전송</button>
+    </div>
+
+    <div x-show="toastMessage" class="toast-wrapper">
+      <div class="toast" x-text="toastMessage"></div>
+    </div>
+
+  </div>
+</body>
+</html>

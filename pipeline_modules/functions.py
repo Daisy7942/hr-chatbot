@@ -1322,7 +1322,7 @@ def build_change_entry(old_meta, new_meta, old_text, new_text, now):
 
 
 # ── 에러 로그 기록 함수 ─────────────────────────────────────────────────────
-def write_error_log(preprocessing_errors, chunking_errors, indexing_errors):
+def write_error_log(preprocessing_errors, chunking_errors, indexing_errors, uncaught_exceptions=None):
     # 1~3단계에서 수집한 에러·경고를 하나의 파일(error.log)에 단계별로 구분해 저장한다.
     # 실행이 끝난 뒤 이 파일을 열어 어떤 직원 데이터에 문제가 있었는지 확인할 수 있다.
     #
@@ -1330,8 +1330,15 @@ def write_error_log(preprocessing_errors, chunking_errors, indexing_errors):
     #   [1단계 전처리 에러] 컬럼이 왜 어떤 값으로 교정됐는지, 어떤 행이 제거됐는지
     #   [3단계 청킹 경고]   토큰 한계 초과·빈 텍스트 등 임베딩 관련 경고
     #   [3단계 적재 실패]   OpenSearch에 문서를 넣지 못한 경우
+    #   [예상 못한 예외]    각 단계의 try/except 로 격리된 예외 (옵션)
+    #
+    # uncaught_exceptions 는 [{'단계','대상','오류','상세'}, ...] 형태.
+    # 호출 측에서 안 넘기거나 비어있으면 해당 섹션은 비어 있는 채로 기록된다.
     #
     # encoding='utf-8-sig': 엑셀에서 열었을 때 한글이 깨지지 않도록 BOM을 붙인다.
+    if uncaught_exceptions is None:
+        uncaught_exceptions = []
+
     os.makedirs(ERROR_LOG_PATH.parent, exist_ok=True)
     with open(ERROR_LOG_PATH, 'w', encoding='utf-8-sig') as log_file:
         log_file.write('========== 1단계: 전처리 에러 ==========\n')
@@ -1347,5 +1354,18 @@ def write_error_log(preprocessing_errors, chunking_errors, indexing_errors):
         columns = ['인덱스명', '문서ID', '오류']
         log_file.write(pd.DataFrame(indexing_errors, columns=columns).to_csv(index=False))
 
-    total = len(preprocessing_errors) + len(chunking_errors) + len(indexing_errors)
+        # 각 단계가 try/except 로 격리한 '예상 못한 예외'를 모아서 기록한다.
+        # 단계별 에러가 데이터 검증 결과라면, 이 섹션은 코드/연결/메모리 등에서 생긴 예외다.
+        log_file.write('\n========== 예상 못한 예외 (격리됨) ==========\n')
+        columns = ['단계', '대상', '오류', '상세']
+        log_file.write(pd.DataFrame(uncaught_exceptions, columns=columns).to_csv(index=False))
+
+    total = (
+        len(preprocessing_errors)
+        + len(chunking_errors)
+        + len(indexing_errors)
+        + len(uncaught_exceptions)
+    )
     print(f'\n에러 로그 저장: {ERROR_LOG_PATH}  (총 {total:,}건)')
+    if uncaught_exceptions:
+        print(f'  └ 격리된 예외: {len(uncaught_exceptions):,}건')

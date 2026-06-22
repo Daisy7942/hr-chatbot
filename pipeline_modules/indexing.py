@@ -1,11 +1,19 @@
 # ══════════════════════════════════════════════════════════════════════════════
 # 3단계 처리: 인덱스 생성 · 인덱스별 청킹/변경감지/적재 (functions.py 헬퍼 사용)
 # ══════════════════════════════════════════════════════════════════════════════
+#
+# 예외 처리 원칙:
+#   - 한 인덱스 처리가 실패해도 다른 인덱스는 계속 진행한다.
+#   - 한 직원의 필드 통합/청킹이 실패해도 다른 직원은 계속 진행한다.
+#   - get_existing_docs 실패는 빈 결과로 간주 (모든 직원이 신규로 보임 — 안전한 쪽).
+#   - bulk 적재는 이미 raise_on_error=False 로 처리되어 있어 일부 실패해도 계속 진행한다.
+#   - 격리된 예외는 uncaught_exceptions 리스트에 모아 pipeline.py 가 최종 로그한다.
+import traceback
 from datetime import datetime
 from opensearchpy import helpers
 import pipeline_modules.functions as fn
 from pipeline_modules.config import INDEX_CONFIG, MAX_TOKENS, EMBEDDING_BATCH_SIZE
-from pipeline_modules.errors import PipelineError
+from pipeline_modules.errors import PipelineError, PipelineStop
 
 
 def create_indices(client):
@@ -45,6 +53,7 @@ def create_indices(client):
             client.indices.create(index=name, body=fn.build_index_body(config['required_level']))
             print(f'  생성 완료: {name}  (required_level={config["required_level"]})')
         except Exception as error:
+            # 인덱스 생성 실패는 이후 단계가 의미 없어지는 '필수' 장애라 중단한다.
             print(f'  인덱스 생성 실패: {name}  → {error}')
             raise PipelineError('파이프라인을 중단합니다. 위 메시지를 확인해주세요.')
 
@@ -72,8 +81,9 @@ def run_indexing(records_by_source, model, client):
     # 무변경 문서는 건드리지 않으므로 timestamp가 갱신되지 않는다.
     indexed_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    indexing_errors = []   # 적재 실패 모음 (마지막에 error.log로 남긴다)
-    chunking_errors = []   # 청킹 경고 모음 (마지막에 error.log로 남긴다)
+    indexing_errors    = []   # 적재 실패 모음 (마지막에 error.log로 남긴다)
+    chunking_errors    = []   # 청킹 경고 모음 (마지막에 error.log로 남긴다)
+    uncaught_exceptions = []  # 예상 못한 예외 격리 모음
 
     # ── ① 직원별 필드 통합 ──────────────────────────────────────────────────
     # 기본인사정보·역량성과·급여정보 세 CSV의 레코드가 records_by_source에 소스별로 따로 있다.
@@ -83,183 +93,303 @@ def run_indexing(records_by_source, model, client):
     field_to_source = {}  # 필드명 -> 원본 CSV 파일명 (예: '연봉' -> '급여정보.csv')
     for source_name in records_by_source:
         for rec in records_by_source[source_name]:
-            emp_id = rec.get('employee_id', '')
-            # embedding_text를 다시 딕셔너리로 파싱해 필드별로 접근할 수 있게 한다
-            parsed = fn.parse_embedding_text(rec.get('embedding_text', ''))
-            if emp_id not in employees:
-                # 처음 등장한 직원이면 빈 딕셔너리로 초기화
-                employees[emp_id] = {'meta': rec, 'parsed': {}}
-            # 같은 직원이 여러 소스에 있으면 parsed를 덮어쓰지 않고 합친다 (update)
-            employees[emp_id]['parsed'].update(parsed)
-            # 필드가 어느 CSV에서 왔는지 기록해둔다 (인덱스별 source 필드 값 결정에 사용)
-            for field in parsed:
-                if field not in field_to_source:
-                    field_to_source[field] = rec.get('source', '')
+            # 한 직원 통합이 깨져도 다른 직원은 계속 처리한다.
+            try:
+                emp_id = rec.get('employee_id', '')
+                # embedding_text를 다시 딕셔너리로 파싱해 필드별로 접근할 수 있게 한다
+                parsed = fn.parse_embedding_text(rec.get('embedding_text', ''))
+                if emp_id not in employees:
+                    # 처음 등장한 직원이면 빈 딕셔너리로 초기화
+                    employees[emp_id] = {'meta': rec, 'parsed': {}}
+                # 같은 직원이 여러 소스에 있으면 parsed를 덮어쓰지 않고 합친다 (update)
+                employees[emp_id]['parsed'].update(parsed)
+                # 필드가 어느 CSV에서 왔는지 기록해둔다 (인덱스별 source 필드 값 결정에 사용)
+                for field in parsed:
+                    if field not in field_to_source:
+                        field_to_source[field] = rec.get('source', '')
+            except Exception as error:
+                emp_id_for_log = rec.get('employee_id', '알수없음') if isinstance(rec, dict) else '알수없음'
+                print(f'  [경고] 직원 필드 통합 실패({emp_id_for_log}) → 건너뜀: {error}')
+                uncaught_exceptions.append({
+                    '단계': '3단계 인덱싱(필드 통합)',
+                    '대상': emp_id_for_log,
+                    '오류': str(error),
+                    '상세': traceback.format_exc(),
+                })
+                continue
 
     # ── ② 인덱스별 처리 ────────────────────────────────────────────────────────
     # INDEX_CONFIG에 정의된 인덱스(hr_basic_1, hr_basic_2, ...) 를 하나씩 처리한다.
     for index_name, config in INDEX_CONFIG.items():
-        fields = config['fields']  # 이 인덱스에 저장할 필드 목록
+        # 한 인덱스 처리 전체를 try 로 감싼다. 실패해도 다른 인덱스는 계속 진행.
+        try:
+            fields = config['fields']  # 이 인덱스에 저장할 필드 목록
 
-        # 이 인덱스에 들어가는 필드들이 어느 원본 CSV에서 왔는지 확인한다.
-        # 같은 인덱스의 필드는 모두 같은 CSV에서 오므로 첫 번째 매칭 필드만 확인한다.
-        # 결과는 OpenSearch 문서의 source 필드에 저장된다 (예: '급여정보.csv').
-        index_source = ''
-        for field in fields:
-            if field in field_to_source:
-                index_source = field_to_source[field]
-                break
+            # 이 인덱스에 들어가는 필드들이 어느 원본 CSV에서 왔는지 확인한다.
+            # 같은 인덱스의 필드는 모두 같은 CSV에서 오므로 첫 번째 매칭 필드만 확인한다.
+            # 결과는 OpenSearch 문서의 source 필드에 저장된다 (예: '급여정보.csv').
+            index_source = ''
+            for field in fields:
+                if field in field_to_source:
+                    index_source = field_to_source[field]
+                    break
 
-        # (가) OpenSearch에서 이 인덱스의 기존 문서를 모두 읽어온다.
-        # 나중에 새 데이터와 비교해 신규·변경·무변경을 판단한다.
-        old_data = fn.get_existing_docs(client, index_name)
-
-        # (나) 각 직원에 대해 이 인덱스에 필요한 필드만 골라 청킹한다.
-        # employees에는 모든 소스의 필드가 합쳐져 있으므로,
-        # build_filtered_text로 이 인덱스 필드만 추출한 뒤 청킹한다.
-        new_by_emp = {}   # 사원번호 -> {'meta': 레코드, 'chunk_texts': [청크텍스트, ...]}
-        for emp_id in employees:
-            info = employees[emp_id]
-            # 이 인덱스에 필요한 필드만 골라 텍스트를 만든다
-            filtered = fn.build_filtered_text(info['parsed'], fields)
-            if not filtered:
-                # 이 직원에게 이 인덱스의 필드 데이터가 없으면 건너뛴다
-                continue
-            normalized = fn.normalize_text(filtered)
-            if not normalized.strip():
-                chunking_errors.append({
-                    '사원번호': emp_id,
-                    '사유':    '빈 embedding_text로 스킵',
-                    '상세':    index_name,
+            # (가) OpenSearch에서 이 인덱스의 기존 문서를 모두 읽어온다.
+            # 실패하면 이 인덱스 전체를 건너뛴다 (continue).
+            # 이전에는 빈 dict 로 진행했지만, 그러면 모든 직원이 '신규'로 분류되어
+            # changed 변경 이력 배열이 [] 로 덮어써져 누적된 모든 이력이 사라진다.
+            # 인덱스를 건너뛰면 OpenSearch 의 기존 데이터가 그대로 보존된다.
+            try:
+                old_data = fn.get_existing_docs(client, index_name)
+            except Exception as error:
+                print(f'  [경고] {index_name} 기존 문서 조회 실패 → 이 인덱스 건너뜀(기존 데이터 보존): {error}')
+                uncaught_exceptions.append({
+                    '단계': '3단계 인덱싱(기존 문서 조회)',
+                    '대상': index_name,
+                    '오류': str(error),
+                    '상세': traceback.format_exc(),
                 })
                 continue
-            # MAX_TOKENS 기준으로 필드를 여러 청크로 나눈다
-            chunk_texts = fn.chunk_by_tokens(normalized, MAX_TOKENS, tokenizer)
-            new_by_emp[emp_id] = {'meta': info['meta'], 'chunk_texts': chunk_texts}
 
-            # 청킹 결과를 검증한다. 필드 하나가 MAX_TOKENS보다 길면
-            # 임베딩 모델이 뒷부분을 잘라내므로 경고를 기록한다.
-            for chunk_text in chunk_texts:
-                token_count = len(tokenizer.encode(chunk_text))
-                if token_count > MAX_TOKENS:
-                    chunking_errors.append({
-                        '사원번호': emp_id,
-                        '사유':    '토큰 한계 초과',
-                        '상세':    f'{index_name}: {token_count}토큰 > 한계 {MAX_TOKENS} (임베딩 시 잘릴 수 있음)',
+            # (나) 각 직원에 대해 이 인덱스에 필요한 필드만 골라 청킹한다.
+            # employees에는 모든 소스의 필드가 합쳐져 있으므로,
+            # build_filtered_text로 이 인덱스 필드만 추출한 뒤 청킹한다.
+            new_by_emp = {}   # 사원번호 -> {'meta': 레코드, 'chunk_texts': [청크텍스트, ...]}
+            for emp_id in employees:
+                # 한 직원 청킹이 깨져도 다른 직원은 계속 처리한다.
+                try:
+                    info = employees[emp_id]
+                    # 이 인덱스에 필요한 필드만 골라 텍스트를 만든다
+                    filtered = fn.build_filtered_text(info['parsed'], fields)
+                    if not filtered:
+                        # 이 직원에게 이 인덱스의 필드 데이터가 없으면 건너뛴다
+                        continue
+                    normalized = fn.normalize_text(filtered)
+                    if not normalized.strip():
+                        chunking_errors.append({
+                            '사원번호': emp_id,
+                            '사유':    '빈 embedding_text로 스킵',
+                            '상세':    index_name,
+                        })
+                        continue
+                    # MAX_TOKENS 기준으로 필드를 여러 청크로 나눈다
+                    chunk_texts = fn.chunk_by_tokens(normalized, MAX_TOKENS, tokenizer)
+
+                    # 청킹 결과를 먼저 검증한다. 필드 하나가 MAX_TOKENS보다 길면
+                    # 임베딩 모델이 뒷부분을 잘라내므로 경고를 기록한다.
+                    # 이 검증 단계에서 tokenizer.encode 가 예외를 던지면 except 로 빠지므로,
+                    # new_by_emp 등록은 검증을 모두 통과한 뒤에 한 번에 한다.
+                    for chunk_text in chunk_texts:
+                        token_count = len(tokenizer.encode(chunk_text))
+                        if token_count > MAX_TOKENS:
+                            chunking_errors.append({
+                                '사원번호': emp_id,
+                                '사유':    '토큰 한계 초과',
+                                '상세':    f'{index_name}: {token_count}토큰 > 한계 {MAX_TOKENS} (임베딩 시 잘릴 수 있음)',
+                            })
+
+                    # 여기까지 예외 없이 도착하면 비로소 new_by_emp 에 commit 한다.
+                    new_by_emp[emp_id] = {'meta': info['meta'], 'chunk_texts': chunk_texts}
+                except Exception as error:
+                    print(f'  [경고] {index_name} {emp_id} 청킹 실패 → 건너뜀: {error}')
+                    uncaught_exceptions.append({
+                        '단계': '3단계 인덱싱(청킹)',
+                        '대상': f'{index_name}/{emp_id}',
+                        '오류': str(error),
+                        '상세': traceback.format_exc(),
                     })
-
-        # (다) 신규 / 변경 / 무변경 분류
-        # texts_to_embed와 plan은 반드시 같은 순서로 쌓아야 한다.
-        # model.encode()가 texts_to_embed를 순서대로 벡터로 변환하고,
-        # 그 결과를 plan과 zip으로 짝지어 문서를 만들기 때문이다.
-        texts_to_embed = []   # 임베딩할 텍스트 목록 (청크 단위)
-        plan           = []   # 적재할 문서 정보 목록: (사원번호, 꼬리표, 변경이력, 청크텍스트)
-        update_emp_ids = []   # 기존 청크를 삭제해야 하는 직원 목록 (변경 직원만)
-        new_count      = 0    # 신규 직원 수 (통계용)
-        changed_count  = 0    # 변경 직원 수 (통계용)
-        skip_count     = 0    # 무변경 직원 수 (통계용)
-
-        for emp_id in new_by_emp:
-            info = new_by_emp[emp_id]
-            # 청크들을 다시 이어 붙여 "이 직원의 전체 텍스트"로 만든다 (비교용)
-            new_text = '\n'.join(info['chunk_texts'])
-            new_meta = info['meta']  # 꼬리표(이름·부서·직급 등)
-
-            if emp_id not in old_data:
-                # OpenSearch에 없는 직원 → 신규 적재, 변경이력 없음
-                changed = []
-                new_count += 1
-            else:
-                old_text = old_data[emp_id]['text']
-                old_meta = old_data[emp_id]['meta']
-                # doc_signature로 꼬리표+텍스트 전체를 비교한다.
-                # 텍스트만 같아도 부서·직급이 바뀌면 signature가 달라진다.
-                if fn.doc_signature(old_meta, old_text) == fn.doc_signature(new_meta, new_text):
-                    # 아무것도 바뀌지 않았으면 임베딩·적재를 생략한다 (비용 절약)
-                    skip_count += 1
                     continue
-                # 뭔가 바뀐 직원 → 변경이력을 기존 이력 뒤에 덧붙인다
-                old_changed = old_data[emp_id]['changed']
-                changed = old_changed + [fn.build_change_entry(old_meta, new_meta, old_text, new_text, indexed_at)]
-                update_emp_ids.append(emp_id)  # 기존 청크 삭제 대상에 추가
-                changed_count += 1
 
-            # 이 직원의 청크들을 임베딩 목록과 plan에 추가한다
-            for chunk_text in info['chunk_texts']:
-                texts_to_embed.append(chunk_text)
-                plan.append((emp_id, info['meta'], changed, chunk_text))
+            # (다) 신규 / 변경 / 무변경 분류
+            # texts_to_embed와 plan은 반드시 같은 순서로 쌓아야 한다.
+            # model.encode()가 texts_to_embed를 순서대로 벡터로 변환하고,
+            # 그 결과를 plan과 zip으로 짝지어 문서를 만들기 때문이다.
+            texts_to_embed = []   # 임베딩할 텍스트 목록 (청크 단위)
+            plan           = []   # 적재할 문서 정보 목록: (사원번호, 꼬리표, 변경이력, 청크텍스트)
+            update_emp_ids = []   # 기존 청크를 삭제해야 하는 직원 목록 (변경 직원만)
+            new_count      = 0    # 신규 직원 수 (통계용)
+            changed_count  = 0    # 변경 직원 수 (통계용)
+            skip_count     = 0    # 무변경 직원 수 (통계용)
 
-        if not plan:
-            # 이 인덱스에서 신규·변경 직원이 한 명도 없으면 적재할 게 없다
-            print(f'  [{index_name}] 변경 없음 (건너뜀)')
+            for emp_id in new_by_emp:
+                # 한 직원 비교/변경감지 단계 실패해도 다른 직원은 계속 처리.
+                # 트랜잭션 패턴: 모든 작업을 임시 변수에 모은 뒤,
+                # 예외 없이 끝까지 도착했을 때에만 plan / texts_to_embed / update_emp_ids 에 commit 한다.
+                # → 청크 append 도중 예외가 나도 update_emp_ids 에는 추가되지 않아,
+                #   delete_by_query 가 기존 청크를 지웠는데 새 청크는 일부만 적재되는 데이터 손실을 막는다.
+                try:
+                    info = new_by_emp[emp_id]
+                    # 청크들을 다시 이어 붙여 "이 직원의 전체 텍스트"로 만든다 (비교용)
+                    new_text = '\n'.join(info['chunk_texts'])
+                    new_meta = info['meta']  # 꼬리표(이름·부서·직급 등)
+
+                    is_changed = False  # 변경 직원으로 분류됐는지 추적
+                    if emp_id not in old_data:
+                        # OpenSearch에 없는 직원 → 신규 적재, 변경이력 없음
+                        changed = []
+                    else:
+                        old_text = old_data[emp_id]['text']
+                        old_meta = old_data[emp_id]['meta']
+                        # doc_signature로 꼬리표+텍스트 전체를 비교한다.
+                        # 텍스트만 같아도 부서·직급이 바뀌면 signature가 달라진다.
+                        if fn.doc_signature(old_meta, old_text) == fn.doc_signature(new_meta, new_text):
+                            # 아무것도 바뀌지 않았으면 임베딩·적재를 생략한다 (비용 절약)
+                            skip_count += 1
+                            continue
+                        # 뭔가 바뀐 직원 → 변경이력을 기존 이력 뒤에 덧붙인다
+                        old_changed = old_data[emp_id]['changed']
+                        changed = old_changed + [fn.build_change_entry(old_meta, new_meta, old_text, new_text, indexed_at)]
+                        is_changed = True
+
+                    # 임시 버퍼에 이 직원의 청크·plan 항목을 모은다.
+                    # 이 루프에서 예외가 나면 아래 commit 단계로 가지 못하므로
+                    # 외부 상태(plan/texts_to_embed/update_emp_ids)는 깨끗하게 유지된다.
+                    emp_texts = []
+                    emp_plan_items = []
+                    for chunk_text in info['chunk_texts']:
+                        emp_texts.append(chunk_text)
+                        emp_plan_items.append((emp_id, info['meta'], changed, chunk_text))
+
+                    # 여기까지 예외 없이 도착했을 때에만 한 번에 commit 한다.
+                    texts_to_embed.extend(emp_texts)
+                    plan.extend(emp_plan_items)
+                    if is_changed:
+                        update_emp_ids.append(emp_id)
+                        changed_count += 1
+                    else:
+                        new_count += 1
+                except Exception as error:
+                    print(f'  [경고] {index_name} {emp_id} 변경감지 실패 → 건너뜀: {error}')
+                    uncaught_exceptions.append({
+                        '단계': '3단계 인덱싱(변경감지)',
+                        '대상': f'{index_name}/{emp_id}',
+                        '오류': str(error),
+                        '상세': traceback.format_exc(),
+                    })
+                    continue
+
+            if not plan:
+                # 이 인덱스에서 신규·변경 직원이 한 명도 없으면 적재할 게 없다
+                print(f'  [{index_name}] 변경 없음 (건너뜀)')
+                continue
+
+            # 변경된 직원의 기존 청크를 먼저 삭제한다.
+            # 이유: 청킹 결과 청크 수가 달라질 수 있어서 기존 청크(_0001, _0002 등)를
+            # 그냥 덮어쓰면 이전 청크가 남아 중복 문서가 생긴다.
+            # delete_by_query + refresh='true' 로 삭제 후 즉시 검색에서 사라지게 한다.
+            if update_emp_ids:
+                try:
+                    client.delete_by_query(
+                        index=index_name,
+                        body={'query': {'terms': {'employee_id': update_emp_ids}}},
+                        params={'refresh': 'true'},
+                    )
+                except Exception as error:
+                    # 삭제 실패 시 stale 청크가 남으면 중복 검색 결과가 발생한다.
+                    # 부분 삭제 상태에서 새 청크를 넣는 것보다 이 인덱스 전체를 건너뛰는 게 안전하다.
+                    print(f'  [경고] {index_name} 기존 청크 삭제 실패 → 이 인덱스 건너뜀(stale 방지): {error}')
+                    uncaught_exceptions.append({
+                        '단계': '3단계 인덱싱(기존 청크 삭제)',
+                        '대상': index_name,
+                        '오류': str(error),
+                        '상세': traceback.format_exc(),
+                    })
+                    continue
+
+            # 적재할 청크 텍스트들을 한꺼번에 임베딩 벡터로 변환한다.
+            # batch_size만큼 묶어 처리하므로 직원 수가 많아도 메모리를 절약할 수 있다.
+            # convert_to_numpy=True 는 결과를 numpy 배열로 반환해 .tolist() 호출이 가능하게 한다.
+            try:
+                vectors = model.encode(
+                    texts_to_embed, batch_size=EMBEDDING_BATCH_SIZE,
+                    show_progress_bar=False, convert_to_numpy=True,
+                )
+            except Exception as error:
+                # 임베딩 실패는 이 인덱스 전체를 못 만들므로 이 인덱스만 건너뛴다.
+                print(f'  [경고] {index_name} 임베딩 실패 → 이 인덱스 건너뜀: {error}')
+                uncaught_exceptions.append({
+                    '단계': '3단계 인덱싱(임베딩)',
+                    '대상': index_name,
+                    '오류': str(error),
+                    '상세': traceback.format_exc(),
+                })
+                continue
+
+            # plan과 vectors를 zip으로 묶어 각 청크의 벡터와 메타정보를 짝지어 문서를 만든다.
+            # 문서 ID는 'EMP0001_0001' 형식 (사원번호 + 청크 순번 4자리).
+            # chunk_counter로 직원별 청크 순번을 1부터 매긴다.
+            chunk_counter = {}  # 사원번호 -> 현재까지 만든 청크 수
+            actions = []        # helpers.bulk에 넘길 OpenSearch 적재 요청 목록
+            for plan_item, vector in zip(plan, vectors):
+                emp_id, meta, changed, chunk_text = plan_item
+                chunk_counter[emp_id] = chunk_counter.get(emp_id, 0) + 1
+                doc_id = f'{emp_id}_{chunk_counter[emp_id]:04d}'  # 예: EMP0001_0001
+                actions.append({
+                    '_index': index_name,
+                    '_id':    doc_id,
+                    '_source': {
+                        'employee_id':      meta.get('employee_id', ''),
+                        'employee_name':    meta.get('employee_name', ''),
+                        'department':       meta.get('department', ''),
+                        'department_level': int(meta.get('department_level', 0) or 0),
+                        'job_grade':        meta.get('job_grade', ''),
+                        'job_grade_level':  int(meta.get('job_grade_level', 0) or 0),
+                        'source':           index_source,
+                        'timestamp':        indexed_at,
+                        'changed':          changed,
+                        'embedding_text':   chunk_text,
+                        # vector는 numpy 배열이므로 .tolist()로 파이썬 리스트로 변환해야 JSON 직렬화된다
+                        'embedding_vector': vector.tolist(),
+                    },
+                })
+
+            # helpers.bulk로 actions 목록을 OpenSearch에 한꺼번에 전송한다.
+            # raise_on_error=False 로 설정해 일부 문서 적재 실패 시 예외를 던지지 않고
+            # failed 리스트에 모아 계속 진행한다 (한 문서 실패로 전체가 멈추지 않게).
+            try:
+                success, failed = helpers.bulk(client, actions, raise_on_error=False)
+            except Exception as error:
+                # raise_on_error=False 가 잡지 못하는 연결/네트워크 류 예외 격리.
+                print(f'  [경고] {index_name} bulk 적재 자체 실패 → 이 인덱스 건너뜀: {error}')
+                uncaught_exceptions.append({
+                    '단계': '3단계 인덱싱(bulk 호출)',
+                    '대상': index_name,
+                    '오류': str(error),
+                    '상세': traceback.format_exc(),
+                })
+                continue
+
+            print(
+                f'  [{index_name}]  '
+                f'신규 {new_count}명 / 변경 {changed_count}명 / 무변경 {skip_count}명  →  '
+                f'{success:,}건 적재 (실패 {len(failed)}건)'
+            )
+            if failed:
+                print(f'    경고: {len(failed)}건 적재 실패 → {failed[0]}')
+                # helpers.bulk의 실패 항목 구조: {동작이름: {'_id': ..., 'error': ...}}
+                # list(item.values())[0] 으로 안쪽 딕셔너리를 꺼낸다.
+                for item in failed:
+                    info = list(item.values())[0]
+                    indexing_errors.append({
+                        '인덱스명': index_name,
+                        '문서ID':  info.get('_id', ''),
+                        '오류':    str(info.get('error', '')),
+                    })
+        except (PipelineError, PipelineStop):
+            # PipelineError/PipelineStop 은 파이프라인 전체를 멈춰야 하는 신호이므로 다시 던진다.
+            raise
+        except Exception as error:
+            # 인덱스 단위의 마지막 안전망. 위에서 못 잡힌 예외가 와도 다음 인덱스는 계속.
+            print(f'  [경고] {index_name} 처리 중 예상 못한 예외 → 이 인덱스 건너뜀: {error}')
+            uncaught_exceptions.append({
+                '단계': '3단계 인덱싱(인덱스 전체)',
+                '대상': index_name,
+                '오류': str(error),
+                '상세': traceback.format_exc(),
+            })
             continue
 
-        # 변경된 직원의 기존 청크를 먼저 삭제한다.
-        # 이유: 청킹 결과 청크 수가 달라질 수 있어서 기존 청크(_0001, _0002 등)를
-        # 그냥 덮어쓰면 이전 청크가 남아 중복 문서가 생긴다.
-        # delete_by_query + refresh='true' 로 삭제 후 즉시 검색에서 사라지게 한다.
-        if update_emp_ids:
-            client.delete_by_query(
-                index=index_name,
-                body={'query': {'terms': {'employee_id': update_emp_ids}}},
-                params={'refresh': 'true'},
-            )
+    if uncaught_exceptions:
+        print(f'인덱싱 예외 격리: {len(uncaught_exceptions):,}건 (자세한 내용은 error.log)')
 
-        # 적재할 청크 텍스트들을 한꺼번에 임베딩 벡터로 변환한다.
-        # batch_size만큼 묶어 처리하므로 직원 수가 많아도 메모리를 절약할 수 있다.
-        # convert_to_numpy=True 는 결과를 numpy 배열로 반환해 .tolist() 호출이 가능하게 한다.
-        vectors = model.encode(
-            texts_to_embed, batch_size=EMBEDDING_BATCH_SIZE,
-            show_progress_bar=False, convert_to_numpy=True,
-        )
-
-        # plan과 vectors를 zip으로 묶어 각 청크의 벡터와 메타정보를 짝지어 문서를 만든다.
-        # 문서 ID는 'EMP0001_0001' 형식 (사원번호 + 청크 순번 4자리).
-        # chunk_counter로 직원별 청크 순번을 1부터 매긴다.
-        chunk_counter = {}  # 사원번호 -> 현재까지 만든 청크 수
-        actions = []        # helpers.bulk에 넘길 OpenSearch 적재 요청 목록
-        for plan_item, vector in zip(plan, vectors):
-            emp_id, meta, changed, chunk_text = plan_item
-            chunk_counter[emp_id] = chunk_counter.get(emp_id, 0) + 1
-            doc_id = f'{emp_id}_{chunk_counter[emp_id]:04d}'  # 예: EMP0001_0001
-            actions.append({
-                '_index': index_name,
-                '_id':    doc_id,
-                '_source': {
-                    'employee_id':      meta.get('employee_id', ''),
-                    'employee_name':    meta.get('employee_name', ''),
-                    'department':       meta.get('department', ''),
-                    'department_level': int(meta.get('department_level', 0) or 0),
-                    'job_grade':        meta.get('job_grade', ''),
-                    'job_grade_level':  int(meta.get('job_grade_level', 0) or 0),
-                    'source':           index_source,
-                    'timestamp':        indexed_at,
-                    'changed':          changed,
-                    'embedding_text':   chunk_text,
-                    # vector는 numpy 배열이므로 .tolist()로 파이썬 리스트로 변환해야 JSON 직렬화된다
-                    'embedding_vector': vector.tolist(),
-                },
-            })
-
-        # helpers.bulk로 actions 목록을 OpenSearch에 한꺼번에 전송한다.
-        # raise_on_error=False 로 설정해 일부 문서 적재 실패 시 예외를 던지지 않고
-        # failed 리스트에 모아 계속 진행한다 (한 문서 실패로 전체가 멈추지 않게).
-        success, failed = helpers.bulk(client, actions, raise_on_error=False)
-        print(
-            f'  [{index_name}]  '
-            f'신규 {new_count}명 / 변경 {changed_count}명 / 무변경 {skip_count}명  →  '
-            f'{success:,}건 적재 (실패 {len(failed)}건)'
-        )
-        if failed:
-            print(f'    경고: {len(failed)}건 적재 실패 → {failed[0]}')
-            # helpers.bulk의 실패 항목 구조: {동작이름: {'_id': ..., 'error': ...}}
-            # list(item.values())[0] 으로 안쪽 딕셔너리를 꺼낸다.
-            for item in failed:
-                info = list(item.values())[0]
-                indexing_errors.append({
-                    '인덱스명': index_name,
-                    '문서ID':  info.get('_id', ''),
-                    '오류':    str(info.get('error', '')),
-                })
-
-    return indexing_errors, chunking_errors
+    return indexing_errors, chunking_errors, uncaught_exceptions
