@@ -170,7 +170,7 @@ uvicorn app.main:app --reload
 
 ### 프론트 서버 (Express) — 새 터미널
 ```bash
-node server/server.js
+node server.js
 ```
 - `localhost:3000`에서 동작
 - `index.html` 서빙 + `/api/*` 요청을 백엔드로 프록시 중계

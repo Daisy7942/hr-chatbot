@@ -1,6 +1,12 @@
 # ══════════════════════════════════════════════════════════════════════════════
 # 2단계 처리: 정제된 DataFrame -> 직원별 레코드(dict) (functions.py의 to_record 사용)
 # ══════════════════════════════════════════════════════════════════════════════
+#
+# 예외 처리 원칙:
+#   - basic_lookup 만들기에서 한 행이 깨져도 그 행만 건너뛰고 나머지는 계속.
+#   - 직원 한 명 레코드 변환이 깨져도 그 직원만 건너뛰고 나머지는 계속.
+#   - 격리된 예외는 uncaught_exceptions 리스트에 모아 pipeline.py 가 최종 로그한다.
+import traceback
 import pandas as pd
 import pipeline_modules.functions as fn
 
@@ -11,6 +17,8 @@ def run_jsonl_conversion(dfs_clean, source_filenames):
     # 이 레코드들이 3단계에서 OpenSearch에 실제로 저장된다.
     print('\n========== 2단계: JSONL 변환 ==========')
 
+    uncaught_exceptions = []   # 직원 단위로 격리된 예외 모음
+
     # ── basic_lookup 만들기 ──────────────────────────────────────────────────
     # 역량성과·급여정보 CSV에는 이름·부서·직급 컬럼이 없다.
     # 그래서 기본인사정보 CSV를 먼저 {사원번호: {이름, 부서, 직급, ...}} 딕셔너리로 만들어두고,
@@ -18,16 +26,29 @@ def run_jsonl_conversion(dfs_clean, source_filenames):
     basic_key = next((k for k in dfs_clean if '기본인사정보' in k), None)
     basic_df = dfs_clean.get(basic_key, pd.DataFrame()) if basic_key else pd.DataFrame()
     basic_lookup = {}
+
     if not basic_df.empty:
         for row in basic_df.to_dict('records'):
-            emp_id = str(row.get('사원번호', '')).strip()
-            basic_lookup[emp_id] = {
-                '이름':     str(row.get('이름', '')),
-                '부서':     str(row.get('부서', '')),
-                '부서레벨': str(row.get('부서레벨', '')),
-                '직급':     str(row.get('직급', '')),
-                '직급레벨': str(row.get('직급레벨', '')),
-            }
+            # 한 행이 깨져도 다른 행은 계속 처리한다.
+            try:
+                emp_id = str(row.get('사원번호', '')).strip()
+                basic_lookup[emp_id] = {
+                    '이름':     str(row.get('이름', '')),
+                    '부서':     str(row.get('부서', '')),
+                    '부서레벨': str(row.get('부서레벨', '')),
+                    '직급':     str(row.get('직급', '')),
+                    '직급레벨': str(row.get('직급레벨', '')),
+                }
+            except Exception as error:
+                emp_id_for_log = str(row.get('사원번호', '알수없음'))
+                print(f'  [경고] basic_lookup 행 변환 실패({emp_id_for_log}) → 건너뜀: {error}')
+                uncaught_exceptions.append({
+                    '단계': '2단계 변환(basic_lookup)',
+                    '대상': emp_id_for_log,
+                    '오류': str(error),
+                    '상세': traceback.format_exc(),
+                })
+                continue
 
     if not basic_lookup:
         print('경고: 기본인사정보가 없어 이름/부서/직급이 채워지지 않습니다.')
@@ -41,9 +62,25 @@ def run_jsonl_conversion(dfs_clean, source_filenames):
         source_csv = source_filenames.get(source_name, source_name)  # 원본 CSV 파일명
         records = []
         for row in df.to_dict('records'):
-            record = fn.to_record(row, source_name, basic_lookup, source_csv)
-            records.append(record)
+            # 한 직원 레코드 변환이 깨져도 다른 직원은 계속 처리한다.
+            try:
+                record = fn.to_record(row, source_name, basic_lookup, source_csv)
+                records.append(record)
+            except Exception as error:
+                emp_id_for_log = str(row.get('사원번호', '알수없음'))
+                print(f'  [경고] {source_name} 레코드 변환 실패({emp_id_for_log}) → 건너뜀: {error}')
+                uncaught_exceptions.append({
+                    '단계': '2단계 변환(레코드)',
+                    '대상': f'{source_name}/{emp_id_for_log}',
+                    '오류': str(error),
+                    '상세': traceback.format_exc(),
+                })
+                continue
+
         records_by_source[source_name] = records
         print(f'  변환: {source_name}  ({len(records):,}건)')
 
-    return records_by_source
+    if uncaught_exceptions:
+        print(f'변환 예외 격리: {len(uncaught_exceptions):,}건 (자세한 내용은 error.log)')
+
+    return records_by_source, uncaught_exceptions
