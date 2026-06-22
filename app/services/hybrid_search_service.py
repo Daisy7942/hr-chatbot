@@ -1062,6 +1062,7 @@ def search_vector(
     # 보안상 중요:
     # 전체 벡터 검색 후 필터링하지 말고,
     # 먼저 employee_id로 검색 대상을 제한한다.
+    # 사번이 있으면 이름보다 사번을 우선해서 검색 범위를 먼저 고정한다.
     if employee_id:
         employee_id = employee_id.strip().upper()
 
@@ -1132,6 +1133,7 @@ def search_vector(
     if not target_name and extract_name:
         target_name = extract_employee_name(question)
 
+    # 사번이 없을 때만 이름 기반 필터를 붙인다.
     if target_name:
         hits = [
             hit

@@ -14,14 +14,18 @@ from app.services.question_analyzer_service import (
 
 # 이전 대화 기억을 이용해서 후속 질문을 보강하는 함수들
 from app.services.session_service import (
+    extract_employee_id,
+    has_memory_applicable_keyword,
     reset_memory_if_employee_changed,
     resolve_question_with_memory,
     update_memory_from_tasks,
 )
+from app.services.candidate_extractor_service import extract_question_candidates
+from app.services.question_service import is_employee_collection_query
 
 # task 하나를 실제로 처리하는 서비스
 # 권한 판단, 검색, 답변 생성 등이 여기서 수행된다.
-from app.services.task_processor_service import process_task
+from app.services.task_processor_service import is_supervisor_query, process_task
 from app.services.llm_service import get_active_llm_label
 
 
@@ -86,10 +90,50 @@ def build_debug_response(full_response: dict, source_limit: int = 5) -> dict:
     debug_response = full_response.copy()
     sources = full_response.get("sources", [])
 
+    debug_response.pop("answer", None)
     debug_response["sources"] = sources[:source_limit]
     debug_response["source_count"] = len(sources)
 
     return debug_response
+
+
+NON_HR_QUESTION_MESSAGE = (
+    "저는 인사 정보 조회를 돕는 챗봇입니다. "
+    "인사 정보와 관련된 내용을 물어봐 주세요."
+)
+
+
+def is_basic_profile_question(question: str) -> bool:
+    compact_question = question.replace(" ", "")
+    return any(
+        keyword in compact_question
+        for keyword in [
+            "기본정보",
+            "인사정보",
+            "기본인사정보",
+            "인사프로필",
+        ]
+    )
+
+
+def is_non_hr_task_result(tasks: list[dict]) -> bool:
+    if len(tasks) != 1:
+        return False
+
+    task = tasks[0]
+
+    return (
+        task.get("intent") == "unknown"
+        and task.get("target_fields") == ["unknown"]
+        and not task.get("employee_name")
+        and not task.get("employee_id")
+        and not task.get("department")
+        and not task.get("team")
+        and not task.get("job_grade")
+        and not task.get("position")
+        and not task.get("unknown_orgs")
+        and not task.get("filters")
+    )
 
 
 def handle_rag_chat(question: str, employee_id: str) -> dict:
@@ -189,7 +233,20 @@ def handle_rag_chat(question: str, employee_id: str) -> dict:
     # 주의:
     # 여기서 LLM은 의도 분석만 한다.
     # 권한 판단은 절대 LLM에게 맡기지 않는다.
-    analysis = analyze_question_to_tasks(resolved_question)
+    # 사용자 질문에서 LLM에게 넘기기 전에 먼저 후보 단어를 추출한다.
+    # 예: "마케팅부 직원 알려줘" → ["마케팅부"]
+    candidates = extract_question_candidates(resolved_question)
+
+    # 후보 추출 결과를 디버그용으로 출력한다.
+    # ensure_ascii=False를 쓰면 한글이 깨지지 않고 그대로 출력된다.
+    print(
+        "[DEBUG] candidate extraction for LLM hints:",
+        json.dumps(candidates, ensure_ascii=False),
+    )
+
+    # 질문과 함께 미리 뽑은 후보 단어를 LLM 분석 함수에 전달한다.
+    # LLM은 이 candidates를 참고해서 department/team/employee_name 등을 더 정확히 판단한다.
+    analysis = analyze_question_to_tasks(resolved_question, candidates=candidates)
 
     # LLM 분석 소요 시간 출력
     # print(
@@ -209,11 +266,18 @@ def handle_rag_chat(question: str, employee_id: str) -> dict:
     # 이유:
     # LLM이 잘못된 intent나 field를 줄 수 있기 때문에
     # 허용된 intent / 허용된 field만 남기도록 보정한다.
-    tasks = normalize_tasks(analysis, resolved_question)
+    tasks = normalize_tasks(analysis, resolved_question, candidates=candidates)
     print(
-        "[DEBUG] normalized tasks:",
+        "[DEBUG] normalized task after LLM correction:",
         json.dumps(tasks, ensure_ascii=False),
     )
+
+    explicit_employee_id = extract_employee_id(resolved_question)
+    if explicit_employee_id:
+        # 질문 안에 사번이 들어 있으면 task에도 다시 심어서 검색 기준을 고정한다.
+        for task in tasks:
+            if isinstance(task, dict) and not task.get("employee_id"):
+                task["employee_id"] = explicit_employee_id
 
     # 정규화 소요 시간과 task 개수 출력
     # print(
@@ -237,6 +301,28 @@ def handle_rag_chat(question: str, employee_id: str) -> dict:
     # 2. 허용된 필드만 검색 대상으로 선택
     # 3. intent에 따라 직접 조회 또는 hybrid 검색 실행
     # 4. task별 답변 생성
+    has_candidates = any(candidates.get(key) for key in candidates)
+    if (
+        is_non_hr_task_result(tasks)
+        or (
+            not has_candidates
+            and not has_memory_applicable_keyword(resolved_question)
+            and not is_employee_collection_query(resolved_question)
+            and not is_supervisor_query(resolved_question)
+            and not is_basic_profile_question(resolved_question)
+        )
+    ):
+        return {
+            "success": True,
+            "answer": NON_HR_QUESTION_MESSAGE,
+            "permission": {
+                "allowed": True,
+                "permission_level": permission_level,
+                "required_level": 1,
+            },
+            "sources": [],
+        }
+
     task_results = [
         process_task(
             task=task,
@@ -287,6 +373,11 @@ def handle_rag_chat(question: str, employee_id: str) -> dict:
     for result in task_results:
         sources.extend(result.get("sources", []))
 
+    print(
+        "[DEBUG] source preview for verification:",
+        json.dumps(sources[:5], ensure_ascii=False),
+    )
+
     # 전체 /rag-chat 처리 시간 출력
     # print(
     #     "[TIME] rag_chat total:",
@@ -331,7 +422,7 @@ def handle_rag_chat(question: str, employee_id: str) -> dict:
     }
 
     print(
-        "[RESPONSE_DEBUG]",
+        "[DEBUG] response metadata without answer:",
         json.dumps(build_debug_response(full_response), ensure_ascii=False),
     )
 

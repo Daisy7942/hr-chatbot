@@ -4,6 +4,7 @@ import requests
 from common.filter_utils import add_filter_if_missing, value_appears_in_question
 from common.text_utils import compact_text, parse_bool, to_none
 from app.services.llm_service import call_llm_completion
+from app.services.candidate_extractor_service import format_candidates_for_prompt
 
 from app.services.question_service import (
     extract_employee_id,
@@ -870,8 +871,6 @@ def normalize_target_fields_by_question(
     # 기존 target_fields를 그대로 반환한다.
     return target_fields
 
-
-
 def normalize_employee_identity_fields(task: dict) -> tuple[str | None, str | None]:
     """
     LLM이 직원 이름을 employee_id에 넣은 경우를 보정한다.
@@ -1075,8 +1074,9 @@ def normalize_filters(raw_filters) -> list[dict]:
     return normalized_filters
 
 
-def analyze_question_to_tasks(question: str) -> dict:
+def analyze_question_to_tasks(question: str, candidates: dict | None = None) -> dict:
     field_schema_text = build_field_schema_text()
+    candidate_context_text = format_candidates_for_prompt(candidates)
 
 
     prompt = f"""
@@ -1101,6 +1101,17 @@ def analyze_question_to_tasks(question: str) -> dict:
 
         사용 가능한 fields:
         {field_schema_text}
+
+        사전/캐시 기반으로 질문에서 미리 감지한 후보:
+        {candidate_context_text}
+
+        후보 사용 규칙:
+        - 후보는 최종 정답이 아니라 intent/slot 판단을 돕는 힌트다.
+        - employee_name 후보가 사용자 질문에 있으면 employee_name으로 우선 고려한다.
+        - department/team/job_grade/position 후보가 있으면 해당 slot과 filter에 우선 반영한다.
+        - unknown organization candidates는 등록되지 않은 조직명이다. 이를 부분 단어로 나누어 department/team으로 만들지 않는다.
+        - business/domain term 후보는 target_fields와 filters 판단에 참고한다.
+        - 사용자 질문과 후보에 없는 값을 새로 만들지 않는다.
 
         규칙:
         - 값이 없으면 NULL을 쓴다.
@@ -1269,7 +1280,11 @@ def analyze_question_to_tasks(question: str) -> dict:
         return fallback
 
 
-def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
+def normalize_tasks(
+    analysis: dict,
+    question: str = "",
+    candidates: dict | None = None,
+) -> list[dict]:
     """
     LLM 분석 결과를 코드에서 안전하게 보정하는 함수.
 
@@ -1332,7 +1347,8 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
 
     # 사용자가 정확한 부서명/팀명이 아니라 별칭처럼 물어볼 수 있다.
     # 이런 표현을 실제 department 또는 team 값으로 바꿔줄 수 있는지 찾는다.
-    found_org_alias = find_org_alias(question)
+    unknown_org_candidates = (candidates or {}).get("unknown_orgs") or []
+    found_org_alias = None if unknown_org_candidates else find_org_alias(question)
 
     # 별칭이 발견되었고,
     # 아직 정확한 부서/팀을 못 찾은 경우에만 별칭 결과를 사용한다.
@@ -1452,6 +1468,44 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
             target_fields=safe_fields,
             question=question,
         )
+
+        basic_profile_question = any(
+            keyword in compact_text(question)
+            for keyword in [
+                "????",
+                "????",
+                "??????",
+                "?????",
+            ]
+        )
+
+        if basic_profile_question:
+            safe_fields = ["employee", "department", "team", "job_grade", "email"]
+            if not task.get("employee_name") and not task.get("employee_id"):
+                compact_question = compact_text(question)
+                guessed_name = None
+
+                for keyword in [
+                    "기본인사정보",
+                    "기본정보",
+                    "인사정보",
+                    "인사프로필",
+                ]:
+                    if keyword in compact_question:
+                        prefix = compact_question.split(keyword, 1)[0]
+                        prefix = re.sub(r"(님|씨|은|는|이|가|을|를|도|만|요)+$", "", prefix)
+                        if re.fullmatch(r"[가-힣]{2,4}", prefix):
+                            guessed_name = prefix
+                        break
+
+                if not guessed_name:
+                    guessed_name = extract_employee_name(question)
+
+                if guessed_name:
+                    employee_name = guessed_name
+            intent = "single_lookup"
+
+
 
         # -------------------------
         # 3-3. 부서/팀/직급/직책 값 보정
@@ -1733,6 +1787,7 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
         # -------------------------
 
         # 위에서 안전하게 보정한 값들만 최종 task로 저장한다.
+
         normalized_tasks.append(
             {
                 "intent": intent,
@@ -1743,6 +1798,7 @@ def normalize_tasks(analysis: dict, question: str = "") -> list[dict]:
                 "team": team,
                 "job_grade": job_grade,
                 "position": position,
+                "unknown_orgs": unknown_org_candidates,
                 "filters": filters,
                 "sort": sort,
                 "is_self": task_is_self,
