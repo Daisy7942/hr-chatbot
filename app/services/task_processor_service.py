@@ -48,6 +48,7 @@ from common.hr_master_data import (
     TEAMS,
     JOB_GRADES,
     POSITIONS,
+    TEAM_TO_DEPARTMENT,
 )
 
 
@@ -55,9 +56,35 @@ COMMON_ERROR_MESSAGE = "요청하신 정보를 확인할 수 없습니다."
 PERMISSION_DENIED_MESSAGE = "해당 정보에 접근할 권한이 없습니다."
 NO_SEARCH_RESULT_MESSAGE = "조건에 맞는 조회 결과가 없습니다."
 MAX_OUTPUT_EMPLOYEES = 50
-UNSUPPORTED_SUPERVISOR_MESSAGE = (
-    "현재 데이터에는 상사 관계 정보가 없어 상사 조회를 지원할 수 없습니다."
-)
+UNSUPPORTED_SUPERVISOR_MESSAGE = "상사 조회는 미지원합니다."
+
+
+def build_unknown_org_answer(unknown_orgs: list[str]) -> str:
+    if not unknown_orgs:
+        return NO_SEARCH_RESULT_MESSAGE
+
+    unknown_org = unknown_orgs[0]
+    compact_unknown_org = compact_text(unknown_org)
+
+    for department in DEPARTMENTS:
+        department_keyword = compact_text(department).removesuffix("부")
+
+        if department_keyword and department_keyword in compact_unknown_org:
+            teams = [
+                team
+                for team, team_department in TEAM_TO_DEPARTMENT.items()
+                if team_department == department
+            ]
+
+            if teams:
+                return (
+                    f"{unknown_org}은(는) 등록된 팀이 아닙니다.\n"
+                    f"{department} 소속 팀은 {', '.join(teams)}입니다."
+                )
+
+            return f"{unknown_org}은(는) 등록된 팀이 아닙니다."
+
+    return f"{unknown_org}은(는) 등록된 조직명이 아닙니다."
 
 
 def is_supervisor_query(question: str) -> bool:
@@ -80,6 +107,19 @@ def is_supervisor_query(question: str) -> bool:
     ]
 
     return any(keyword in compact_question for keyword in supervisor_keywords)
+
+
+def is_basic_profile_question(question: str) -> bool:
+    compact_question = compact_text(question)
+    return any(
+        keyword in compact_question
+        for keyword in [
+            "기본정보",
+            "인사정보",
+            "기본인사정보",
+            "인사프로필",
+        ]
+    )
 
 
 def build_denied_message(denied_fields: list[str]) -> str:
@@ -553,6 +593,83 @@ def format_allowed_hits_answer(
     # 없으면 조회 결과 없음 메시지를 반환한다.
     return "\n".join(lines) if lines else NO_SEARCH_RESULT_MESSAGE
 
+
+def format_single_lookup_multi_field_answer(
+    hits: list[dict],
+    target_fields: list[str],
+    limit: int = MAX_OUTPUT_EMPLOYEES,
+) -> str:
+    """
+    단일 직원 조회에서 여러 필드를 요청한 경우, LLM 요약 없이 필드별로 직접 조립한다.
+    """
+
+    if not hits or not target_fields:
+        return NO_SEARCH_RESULT_MESSAGE
+
+    grouped_items = {}
+    fallback_items = []
+
+    for item in limit_hits_by_employee_count(hits, limit=limit):
+        source = item.get("_source", {})
+        employee_id = source.get("employee_id")
+
+        if not employee_id:
+            fallback_items.append([item])
+            continue
+
+        grouped_items.setdefault(employee_id, []).append(item)
+
+    ordered_groups = list(grouped_items.values()) + fallback_items
+    lines = []
+    display_fields = [
+        field
+        for field in target_fields
+        if field not in {"employee", "employee_name", "employee_id"}
+    ]
+
+    for group in ordered_groups:
+        first_source = group[0].get("_source", {})
+        employee_name = first_source.get("employee_name", "")
+        employee_id = first_source.get("employee_id", "")
+        prefix = employee_name or employee_id
+
+        field_parts = []
+        for field_key in display_fields:
+            rule = FIELD_RULES.get(field_key)
+            if not rule:
+                continue
+
+            value = None
+            for hit in group:
+                source = hit.get("_source", {})
+                embedding_text = source.get("embedding_text", "")
+                candidate = get_allowed_field_value(
+                    source=source,
+                    embedding_text=embedding_text,
+                    field_key=field_key,
+                )
+                if candidate not in (None, "", "미입력"):
+                    value = candidate
+                    break
+
+            if value in (None, ""):
+                value = "미입력"
+
+            if field_key == "salary":
+                number_value = to_number(value)
+                if number_value is not None:
+                    value = f"{int(number_value):,}원"
+
+            field_parts.append(f"{rule.get('label', field_key)}: {value}")
+
+        if field_parts:
+            if prefix:
+                lines.append(f"{prefix} / " + " / ".join(field_parts))
+            else:
+                lines.append(" / ".join(field_parts))
+
+    return "\n".join(lines) if lines else NO_SEARCH_RESULT_MESSAGE
+
 def to_number(value):
     """
     숫자 비교 조건에 사용할 수 있도록 문자열에서 숫자만 꺼낸다.
@@ -888,7 +1005,7 @@ def process_task(
             "answer": UNSUPPORTED_SUPERVISOR_MESSAGE,
             "sources": [],
             "permission": {
-                "allowed": False,
+                "allowed": True,
                 "ignored": True,
                 "reason": "상사 관계 필드가 없어 처리할 수 없습니다.",
                 "permission_level": permission_level,
@@ -988,6 +1105,22 @@ def process_task(
     if result_limit and isinstance(sort, dict):
         sort["limit"] = result_limit
 
+    print(
+        "[DEBUG] final search routing conditions:",
+        json.dumps(
+            {
+                "intent": intent,
+                "department": task.get("department"),
+                "team": task.get("team"),
+                "job_grade": task.get("job_grade"),
+                "position": task.get("position"),
+                "unknown_orgs": task.get("unknown_orgs") or [],
+                "filters": filters,
+                "sort": sort,
+            },
+            ensure_ascii=False,
+        ),
+    )
 
     target_fields = [
         field
@@ -1077,18 +1210,28 @@ def process_task(
     filters = remove_self_placeholder_filters(filters, is_self)
     task["filters"] = filters
 
+    if intent == "employee_count":
+        task["employee_name"] = None
+        task["employee_id"] = None
+
     actual_employee_name = find_employee_name_in_question(original_question)
 
-    if actual_employee_name and not task.get("employee_name"):
+    if intent != "employee_count" and actual_employee_name and not task.get("employee_name"):
         task["employee_name"] = actual_employee_name
-    elif task.get("employee_name") and task.get("job_grade") and not employee_name_exists(task["employee_name"]):
+    elif (
+        intent != "employee_count"
+        and task.get("employee_name")
+        and task.get("job_grade")
+        and not employee_name_exists(task["employee_name"])
+    ):
         task["employee_name"] = None
 
-    if is_limit_placeholder_name(task.get("employee_name")):
+    if intent != "employee_count" and is_limit_placeholder_name(task.get("employee_name")):
         task["employee_name"] = None
 
     if (
-        filters
+        intent != "employee_count"
+        and filters
         and intent == "single_lookup"
         and not requested_employee_collection
         and not is_self
@@ -1163,6 +1306,7 @@ def process_task(
 
     denied_fields = unique_keep_order(denied_answer_fields + denied_filter_fields)
     denied_message = build_denied_message(denied_fields)
+    basic_profile_question = is_basic_profile_question(original_question)
 
     # 조건 필드 권한이 없으면 검색 자체를 막는다. 조건 검색은 조건값 존재 여부도 정보가 될 수 있다.
     if denied_filter_fields:
@@ -1223,6 +1367,35 @@ def process_task(
     # employee = 누구 정보인지 표시하기 위해 추가
     # search_permission_level = 검색할 때 적용할 권한 레벨
 
+    unknown_orgs = task.get("unknown_orgs") or []
+    has_valid_org_target = any(
+        task.get(key)
+        for key in ["department", "team", "job_grade", "position"]
+    )
+
+    if (
+        unknown_orgs
+        and intent in {"condition_search", "employee_list"}
+        and not has_valid_org_target
+        and not filters
+    ):
+        return {
+            "answer": build_unknown_org_answer(unknown_orgs),
+            "sources": [],
+            "permission": {
+                "allowed": True,
+                "permission_level": permission_level,
+                "required_level": required_level,
+                "allowed_fields": answer_fields,
+                "denied_fields": denied_fields,
+                "is_self": is_self,
+            },
+        }
+
+    if basic_profile_question:
+        answer_fields = ["employee", "department", "team", "job_grade", "email"]
+        denied_message = ""
+
     allowed_fields = list(answer_fields)
     context_fields = unique_keep_order(answer_fields + allowed_filter_fields + sort_fields)
 
@@ -1259,6 +1432,15 @@ def process_task(
     # llm이 employee_id 를 추출을 못할 시 직접 짜놓은 로직으로 추출
     else:
         search_employee_id = extract_employee_id(original_question)
+
+    search_filters = filters
+    if search_employee_id and intent == "single_lookup":
+        # 사번이 확정되면 이름/직함 같은 보조 필터는 빼고 사번 기준으로만 조회한다.
+        search_filters = [
+            item
+            for item in filters
+            if item.get("field") not in {"contract_type", "employee_name"}
+        ]
 
     # hybrid 검색에 사용할 질문 생성
     task_question = build_task_question(original_question, task)
@@ -1433,7 +1615,7 @@ def process_task(
 
         search_employee_name = None
 
-        if intent == "single_lookup":
+        if intent == "single_lookup" and not search_employee_id:
             search_employee_name = task.get("employee_name")
         
         # BM25 검색과 벡터 검색을 각각 수행한 뒤, RRF 방식으로 결과를 병합한다.
@@ -1445,7 +1627,7 @@ def process_task(
             extract_name=False,
             size=50,
             indices=indices,
-            filters=filters,
+            filters=search_filters,
         )
         # print(
         #     "[TIME] search_hybrid call:",
@@ -1458,7 +1640,7 @@ def process_task(
         # 같은 직원의 정보가 여러 인덱스/문서에 나뉘어 있을 수 있으므로, 문서 하나가 아니라 직원 단위로 조건을 만족하는지 판단한다.
         search_hits = filter_hits_by_filters(
             hits=search_hits,
-            filters=filters,
+            filters=search_filters,
         )
 
         # 사용자가 실제로 요청한 필드 값이 있는 검색 결과만 남긴다.
@@ -1467,14 +1649,39 @@ def process_task(
             answer_fields=answer_fields,
         )
         search_hits = sort_hits_by_task_sort(search_hits, sort)
-        # print(
-        #     "[TIME] filter_hits:",
-        #     f"{time.perf_counter() - filter_start_time:.3f}s",
-        #     "hits:",
-        #     len(search_hits),
-        # )
 
-        if not search_hits:
+        # 사용자에게 실제로 보여줄 필드만 따로 뽑는다.
+        # 이름/사번은 prefix로 이미 다루므로 본문에서는 제외한다.
+        detail_fields = [
+            field
+            for field in task.get("target_fields", [])
+            if field not in {"employee", "employee_name", "employee_id"}
+            and field in answer_fields
+        ]
+
+        basic_profile_question = is_basic_profile_question(original_question)
+
+        if basic_profile_question and search_hits:
+            answer = format_allowed_hits_answer(
+                hits=search_hits,
+                allowed_fields=["employee", "department", "team", "job_grade", "email"],
+                limit=result_limit or MAX_OUTPUT_EMPLOYEES,
+            )
+        elif search_employee_name and not search_employee_id and search_hits:
+            # 이름만 있는 질문은 동명이인까지 모두 보여주는 쪽이 더 안전하다.
+            answer = format_allowed_hits_answer(
+                hits=search_hits,
+                allowed_fields=["employee"] + detail_fields,
+                limit=result_limit or MAX_OUTPUT_EMPLOYEES,
+            )
+        elif search_employee_id and len(detail_fields) > 1 and search_hits:
+            # 사번이 있고 필드가 여러 개면 LLM 요약 대신 필드별로 직접 조립한다.
+            answer = format_single_lookup_multi_field_answer(
+                hits=search_hits,
+                target_fields=detail_fields,
+                limit=result_limit or MAX_OUTPUT_EMPLOYEES,
+            )
+        elif not search_hits:
             answer = NO_SEARCH_RESULT_MESSAGE
         elif requested_employee_collection:
             answer = format_allowed_hits_answer(
@@ -1511,7 +1718,7 @@ def process_task(
                 context=context,
             )
 
-    if denied_message:
+    if denied_message and not is_basic_profile_question(original_question):
         answer = f"{answer}\n\n{denied_message}"
 
     # sources_start_time = time.perf_counter()

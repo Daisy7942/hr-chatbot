@@ -16,6 +16,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 
 def get_active_llm_model() -> str:
+    # 운영 환경에서 어떤 모델을 쓸지 한 곳에서만 결정한다.
     if LLM_PROVIDER == "openai":
         return OPENAI_MODEL
 
@@ -23,6 +24,7 @@ def get_active_llm_model() -> str:
 
 
 def get_active_llm_label() -> str:
+    # 디버그 로그에 provider/model을 같이 남길 때 사용한다.
     return f"{LLM_PROVIDER}:{get_active_llm_model()}"
 
 
@@ -115,6 +117,7 @@ def call_llm_completion(
     운영 기본값은 Ollama/Gemma이고, 비교가 필요할 때만 LLM_PROVIDER=openai로 GPT를 사용한다.
     """
 
+    # 호출 지점에서는 provider 차이를 신경 쓰지 않게 숨긴다.
     if LLM_PROVIDER == "openai":
         return call_openai_chat_completion(
             prompt=prompt,
@@ -137,6 +140,7 @@ def build_rag_prompt(question: str, context: str) -> str:
     LLM에 전달할 프롬프트를 생성한다.
     """
 
+    # RAG 답변은 검증된 context만 넣고, 모델의 임의 추측을 줄인다.
     prompt = f"""
         당신은 인사(HR) 데이터를 기반으로 답변하는 RAG 챗봇입니다.
 
@@ -248,6 +252,11 @@ def build_rag_prompt(question: str, context: str) -> str:
         "개발"처럼 단어 하나로만 답하지 말고, 반드시 완성된 문장과 목록으로 답변합니다.
         [목록 질문 요약]이 있으면 그 내용만 사용해서 답변합니다.
         직원 이름으로 답하지 말고, 목록에 있는 항목만 답변합니다.
+
+        [답변 문체]
+                - 같은 사람 이름과 호칭을 문장마다 반복하지 말고, 첫 줄에 한 번만 쓰십시오.
+                - 가능하면 "이름 / 필드: 값" 형태로 짧게 정리하십시오.
+                - 기본정보/인사정보 질문은 회사명, 사업장위치 같은 부가 항목보다 핵심 인사 항목 위주로 답하십시오.
 
 
         [검색 결과]
