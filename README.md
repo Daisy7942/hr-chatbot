@@ -122,6 +122,22 @@ OPENSEARCH_USER=admin          # ← 실제 계정으로 변경
 OPENSEARCH_PASSWORD=yourpw     # ← 실제 비밀번호로 변경
 
 # ┌─────────────────────────────────────────────────────────┐
+# │  ★ 수정 필수 — OpenSearch 설치 경로 (nori 자동 설치에 사용) │
+# └─────────────────────────────────────────────────────────┘
+OPENSEARCH_HOME=C:\path\to\opensearch   # ← 실제 설치 경로로 변경
+
+# ┌─────────────────────────────────────────────────────────┐
+# │  선택 수정 — LLM 설정                                     │
+# └─────────────────────────────────────────────────────────┘
+LLM_PROVIDER=ollama            # ollama 또는 openai
+OLLAMA_URL=http://localhost:11434/api/generate
+OLLAMA_MODEL=gemma3:4b
+
+# OpenAI 사용 시에만 설정 (LLM_PROVIDER=openai 로 변경 필요)
+# OPENAI_API_KEY=<OpenAI API 키>
+# OPENAI_MODEL=gpt-4o-mini
+
+# ┌─────────────────────────────────────────────────────────┐
 # │  선택 수정 — 임베딩/청킹 설정                              │
 # └─────────────────────────────────────────────────────────┘
 EMBED_MODEL_NAME=paraphrase-multilingual-MiniLM-L12-v2
@@ -140,9 +156,7 @@ pip install -r requirements.txt
 
 **Node.js 의존성:**
 ```bash
-cd server
 npm install
-cd ..
 ```
 
 ---
@@ -173,7 +187,7 @@ uvicorn app.main:app --reload
 node server.js
 ```
 - `localhost:3000`에서 동작
-- `index.html` 서빙 + `/api/*` 요청을 백엔드로 프록시 중계
+- `frontend/` 폴더의 정적 파일 서빙 + `/api/*` 요청을 백엔드로 프록시 중계
 
 ### 브라우저 접속
 ```
@@ -243,6 +257,8 @@ dma/
 ├── .env                    ← 환경 변수 (직접 생성, git 제외)
 ├── .env.example            ← 환경 변수 템플릿
 ├── pipeline.py             ← 전체 파이프라인 (1~3단계)
+├── server.js               ← Express 프론트 서버 (정적 파일 + API 프록시)
+├── package.json            ← Node.js 의존성
 ├── requirements.txt        ← Python 의존성
 ├── README.md
 │
@@ -250,11 +266,24 @@ dma/
 │   ├── main.py             ← API 엔드포인트 (/chat, /rag-chat)
 │   └── services/           ← 검색·LLM·질문 분석 로직
 │
-├── server/                 ← Express 프론트 서버
-│   ├── server.js           ← 정적 파일 + API 프록시
-│   └── package.json
+├── frontend/               ← 챗봇 UI
+│   ├── index.html          ← 메인 화면 (Alpine.js)
+│   ├── chatbot.js          ← 챗봇 동작 로직
+│   └── style.css           ← 스타일
 │
-├── index.html              ← 챗봇 UI (Alpine.js 단일 파일)
+├── common/                 ← 백엔드·파이프라인 공통 모듈
+│   ├── hr_fields.py        ← 필드 권한 정의 (FIELD_RULES, ACCESSIBLE_INDICES)
+│   ├── hr_master_data.py   ← 부서·직급 마스터 데이터
+│   ├── filter_utils.py     ← 권한 필터 유틸
+│   └── text_utils.py       ← 텍스트 유틸
+│
+├── pipeline_modules/       ← 파이프라인 내부 모듈
+│   ├── config.py           ← 인덱스 설정, 환경 변수 로딩
+│   ├── preprocess.py       ← 1단계: 전처리
+│   ├── convert.py          ← 2단계: 레코드 변환
+│   ├── indexing.py         ← 3단계: 인덱싱
+│   ├── functions.py        ← 공통 헬퍼 함수
+│   └── errors.py           ← 파이프라인 예외 클래스
 │
 ├── config/
 │   └── user_dictionary.txt ← nori 사용자 사전
@@ -286,7 +315,7 @@ OpenSearch를 재시작한 후 `python pipeline.py`를 다시 실행하세요.
 
 ### 프론트에서 백엔드 응답이 안 옴
 - 백엔드(`localhost:8000`)와 프론트(`localhost:3000`)가 둘 다 떠 있는지 확인
-- `server.js`의 프록시 설정이 백엔드 포트와 일치하는지 확인
+- `.env`의 `BACKEND_URL`이 `http://localhost:8000`으로 설정되어 있는지 확인
 
 ### 파이프라인이 일부 행을 제외함
 - `data/error.log`에서 1단계 전처리 검증 결과 확인 가능
@@ -311,8 +340,12 @@ OpenSearch를 재시작한 후 `python pipeline.py`를 다시 실행하세요.
 | 검색 엔진 | OpenSearch 3.3.2 + nori 플러그인 |
 | 임베딩 모델 | paraphrase-multilingual-MiniLM-L12-v2 (384차원) |
 | 검색 방식 | Hybrid Search (BM25 + KNN, lucene/hnsw/cosinesimil) |
-| LLM | Ollama + gemma3:4b |
+| LLM | Ollama + gemma3:4b (기본) / OpenAI GPT (선택) |
 | 백엔드 | FastAPI (Python) |
 | 프론트 서버 | Node.js + Express |
-| 프론트 UI | HTML + Alpine.js + Tailwind |
+| 프론트 UI | HTML + Alpine.js |
 | 데이터 처리 | pandas, sentence-transformers |
+
+## 시스템 흐름도
+
+![시스템 흐름도](docs/docs.png)

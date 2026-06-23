@@ -16,7 +16,14 @@ function chatbot() {
         this.showToast("사번을 입력해주세요.");
         return;
       }
-      this.savedEmployeeId = this.employeeId.trim().toUpperCase();
+      const newId = this.employeeId.trim().toUpperCase();
+      if (newId === this.savedEmployeeId) {
+        this.showToast("이미 적용된 사번입니다.");
+        return;
+      }
+      this.savedEmployeeId = newId;
+      this.messages = [];
+      this.permissionLevel = null;
       this.showToast("사번 " + this.savedEmployeeId + " 적용 완료");
     },
 
