@@ -1717,10 +1717,32 @@ def process_task(
             hits=search_hits,
             answer_fields=answer_fields,
         )
-        search_hits = filter_retired_hits_by_permission(
+        visible_hits = filter_retired_hits_by_permission(
             hits=search_hits,
             permission_level=permission_level,
         )
+
+        if (
+            search_employee_name
+            and not search_employee_id
+            and permission_level < 3
+            and search_hits
+            and not visible_hits
+        ):
+            return {
+                "answer": RETIRED_EMPLOYEE_RESTRICTED_MESSAGE,
+                "sources": [],
+                "permission": {
+                    "allowed": False,
+                    "permission_level": permission_level,
+                    "required_level": 3,
+                    "allowed_fields": [],
+                    "denied_fields": answer_fields,
+                    "is_self": is_self,
+                },
+            }
+
+        search_hits = visible_hits
         search_hits = sort_hits_by_task_sort(search_hits, sort)
 
         # 사용자에게 실제로 보여줄 필드만 따로 뽑는다.
