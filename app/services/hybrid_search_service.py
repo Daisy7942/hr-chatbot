@@ -660,6 +660,46 @@ def get_user_permission_level(employee_id: str) -> int | None:
     return max(department_level, job_grade_level)
 
 
+def is_retired_employee(employee_id: str) -> bool:
+    """
+    요청자 사번이 퇴사자이면 True를 반환한다.
+    퇴직일자 값이 비어 있거나 '미입력'이면 재직자로 본다.
+    """
+
+    if not employee_id:
+        return False
+
+    query = {
+        "query": {
+            "bool": {
+                "filter": [
+                    {"term": {"employee_id": employee_id.strip().upper()}}
+                ]
+            }
+        },
+        "size": 1,
+        "_source": ["embedding_text"],
+    }
+
+    response = client.search(
+        index=["hr_basic_3"],
+        body=query,
+    )
+
+    hits = response["hits"]["hits"]
+
+    if not hits:
+        return False
+
+    source = hits[0].get("_source", {})
+    retirement_date = extract_embedding_text_field(
+        embedding_text=source.get("embedding_text", ""),
+        field_name="퇴직일자",
+    )
+
+    return bool(retirement_date and retirement_date.strip() not in {"미입력", "NULL", "None", "none", "null", "-"})
+
+
 # =========================
 # 질문 기반 검색 인덱스 선택 함수
 # =========================
@@ -1062,6 +1102,7 @@ def search_vector(
     # 보안상 중요:
     # 전체 벡터 검색 후 필터링하지 말고,
     # 먼저 employee_id로 검색 대상을 제한한다.
+    # 사번이 있으면 이름보다 사번을 우선해서 검색 범위를 먼저 고정한다.
     if employee_id:
         employee_id = employee_id.strip().upper()
 
@@ -1132,6 +1173,7 @@ def search_vector(
     if not target_name and extract_name:
         target_name = extract_employee_name(question)
 
+    # 사번이 없을 때만 이름 기반 필터를 붙인다.
     if target_name:
         hits = [
             hit
@@ -1583,6 +1625,9 @@ def build_filter_search_clause(filter_item: dict) -> dict | None:
     rule = FIELD_RULES[field]
 
     if op == "exists":
+        if rule.get("embedding_label"):
+            return None
+
         return build_field_exists_clause(rule)
 
     # 숫자 비교는 OpenSearch에서 직접 처리하지 않고,
@@ -1631,7 +1676,8 @@ def search_employees_by_filter_conditions(
         "query": (
             {
                 "bool": {
-                    "filter": filter_conditions
+                    "should": filter_conditions,
+                    "minimum_should_match": 1,
                 }
             }
             if filter_conditions
