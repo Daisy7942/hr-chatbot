@@ -9,7 +9,7 @@ from datetime import date
 from dotenv import load_dotenv
 
 # 부서·직책 같은 조직 기준 데이터는 app과 공통으로 쓰므로 common에서 가져온다.
-from common.hr_master_data import DEPARTMENTS, POSITIONS
+from common.hr_master_data import DEPARTMENTS, POSITIONS, TEAM_TO_DEPARTMENT
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent  # pipeline_modules/ 의 상위 = 프로젝트 루트
@@ -114,13 +114,12 @@ MIN_TOEIC,        MAX_TOEIC        = 0, 990
 
 # DEPARTMENTS 는 common.hr_master_data 에서 가져온다 (위 import 참고)
 
-DEPT_TEAM_MAP = {
-    '개발부':   ['백엔드팀', '프론트팀', 'AI팀', '인프라팀'],
-    '인사부':   ['채용팀', '교육팀'],
-    '영업부':   ['국내영업팀', '해외영업팀'],
-    '마케팅부': ['디지털마케팅팀', '브랜드팀'],
-    '기획부':   ['전략기획팀', '사업기획팀']
-}
+# TEAM_TO_DEPARTMENT(common)에서 자동으로 만든다 — 팀 추가 시 hr_master_data.py만 수정하면 된다.
+DEPT_TEAM_MAP = {}
+for _team, _dept in TEAM_TO_DEPARTMENT.items():
+    if _dept not in DEPT_TEAM_MAP:
+        DEPT_TEAM_MAP[_dept] = []
+    DEPT_TEAM_MAP[_dept].append(_team)
 
 DEPT_LEVEL_MAP = {
     '개발부':   1,

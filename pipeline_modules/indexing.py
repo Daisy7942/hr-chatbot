@@ -5,7 +5,7 @@
 # 예외 처리 원칙:
 #   - 한 인덱스 처리가 실패해도 다른 인덱스는 계속 진행한다.
 #   - 한 직원의 필드 통합/청킹이 실패해도 다른 직원은 계속 진행한다.
-#   - get_existing_docs 실패는 빈 결과로 간주 (모든 직원이 신규로 보임 — 안전한 쪽).
+#   - get_existing_docs 실패 시 해당 인덱스 건너뜀 (빈 결과로 진행하면 변경이력이 초기화되므로).
 #   - bulk 적재는 이미 raise_on_error=False 로 처리되어 있어 일부 실패해도 계속 진행한다.
 #   - 격리된 예외는 uncaught_exceptions 리스트에 모아 pipeline.py 가 최종 로그한다.
 import traceback

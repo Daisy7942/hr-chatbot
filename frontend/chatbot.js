@@ -47,6 +47,10 @@ function chatbot() {
 
     async retry(failedQuestion) {
       if (!failedQuestion) return;
+      // 재시도 전에 이 질문의 에러 버블을 먼저 제거한다
+      this.messages = this.messages.filter(
+        msg => !(msg.role === "error" && msg.question === failedQuestion)
+      );
       await this.callBackend(failedQuestion);
     },
 
