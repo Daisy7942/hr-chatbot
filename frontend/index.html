@@ -4,8 +4,8 @@
   <meta charset="UTF-8">
   <title>인사데이터 권한기반 챗봇</title>
   <link rel="stylesheet" href="/style.css">
-  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3/dist/cdn.min.js"></script>
   <script defer src="/chatbot.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3/dist/cdn.min.js"></script>
 </head>
 
 <body>
@@ -40,9 +40,7 @@
 
           <div x-show="msg.role === 'bot' && msg.sources && msg.sources.length > 0"
                class="sources">
-            <template x-for="indexName in uniqueIndices(msg.sources)" :key="indexName">
-              <div class="source-card">출처: <span x-text="indexName"></span></div>
-            </template>
+            <div class="source-card">출처: <span x-text="uniqueIndices(msg.sources).join(', ')"></span></div>
           </div>
 
           <div x-show="msg.role === 'error'" class="message message-error">
