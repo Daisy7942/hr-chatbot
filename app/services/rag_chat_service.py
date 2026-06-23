@@ -136,6 +136,56 @@ def is_non_hr_task_result(tasks: list[dict]) -> bool:
     )
 
 
+def split_single_lookup_tasks_by_employee_candidates(
+    tasks: list[dict],
+    employee_names: list[str],
+) -> list[dict]:
+    if len(employee_names) <= 1 or len(tasks) != 1:
+        return tasks
+
+    task = tasks[0]
+
+    if not isinstance(task, dict):
+        return tasks
+
+    if task.get("intent") != "single_lookup":
+        return tasks
+
+    if task.get("employee_id") or task.get("is_self"):
+        return tasks
+
+    split_tasks = []
+    for employee_name in employee_names:
+        cloned_task = task.copy()
+        cloned_task["employee_name"] = employee_name
+        cloned_task["is_self"] = False
+        split_tasks.append(cloned_task)
+
+    return split_tasks
+
+
+def suppress_hidden_retired_results_for_multi_name_query(
+    task_results: list[dict],
+    employee_names: list[str],
+) -> list[dict]:
+    if len(employee_names) <= 1:
+        return task_results
+
+    has_visible_result = any(
+        result.get("permission", {}).get("allowed") and result.get("sources")
+        for result in task_results
+    )
+
+    if not has_visible_result:
+        return task_results
+
+    return [
+        result
+        for result in task_results
+        if result.get("permission", {}).get("allowed")
+    ]
+
+
 def handle_rag_chat(question: str, employee_id: str) -> dict:
     """
     /rag-chat 요청의 전체 처리 흐름을 담당하는 함수.
@@ -288,12 +338,19 @@ def handle_rag_chat(question: str, employee_id: str) -> dict:
         json.dumps(tasks, ensure_ascii=False),
     )
 
+    employee_name_candidates = candidates.get("employee_names") or []
+
     explicit_employee_id = extract_employee_id(resolved_question)
     if explicit_employee_id:
         # 질문 안에 사번이 들어 있으면 task에도 다시 심어서 검색 기준을 고정한다.
         for task in tasks:
             if isinstance(task, dict) and not task.get("employee_id"):
                 task["employee_id"] = explicit_employee_id
+
+    tasks = split_single_lookup_tasks_by_employee_candidates(
+        tasks=tasks,
+        employee_names=employee_name_candidates,
+    )
 
     # 정규화 소요 시간과 task 개수 출력
     # print(
@@ -348,6 +405,10 @@ def handle_rag_chat(question: str, employee_id: str) -> dict:
         )
         for task in tasks
     ]
+    task_results = suppress_hidden_retired_results_for_multi_name_query(
+        task_results=task_results,
+        employee_names=employee_name_candidates,
+    )
 
     # =========================
     # 6. 대화 기억 업데이트
