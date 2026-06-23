@@ -4,7 +4,7 @@ import json
 from fastapi import HTTPException
 
 # 요청자의 권한 레벨을 조회하는 함수
-from app.services.hybrid_search_service import get_user_permission_level
+from app.services.hybrid_search_service import get_user_permission_level, is_retired_employee
 
 # 질문을 LLM으로 분석해서 task 목록으로 나누는 함수들
 from app.services.question_analyzer_service import (
@@ -194,6 +194,22 @@ def handle_rag_chat(question: str, employee_id: str) -> dict:
             status_code=400,
             detail="계산된 permission_level이 유효하지 않습니다.",
         )
+
+    if is_retired_employee(employee_id):
+        return {
+            "success": False,
+            "answer": "퇴사 처리된 계정입니다.",
+            "permission": {
+                "allowed": False,
+                "permission_level": permission_level,
+                "required_level": 1,
+            },
+            "sources": [],
+            "error": {
+                "code": "RETIRED_EMPLOYEE",
+                "message": "퇴사 처리된 계정입니다.",
+            },
+        }
 
     # =========================
     # 2. 이전 대화 기억으로 질문 보강

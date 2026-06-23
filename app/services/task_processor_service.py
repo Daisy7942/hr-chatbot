@@ -30,6 +30,7 @@ from app.services.hybrid_search_service import (
     find_employee_name_in_question,
     get_allowed_field_value,
     get_category_values,
+    is_retired_employee,
     make_sources,
     search_employees_by_conditions,
     search_employees_by_filter_conditions,
@@ -57,6 +58,7 @@ PERMISSION_DENIED_MESSAGE = "해당 정보에 접근할 권한이 없습니다."
 NO_SEARCH_RESULT_MESSAGE = "조건에 맞는 조회 결과가 없습니다."
 MAX_OUTPUT_EMPLOYEES = 50
 UNSUPPORTED_SUPERVISOR_MESSAGE = "상사 조회는 미지원합니다."
+RETIRED_EMPLOYEE_RESTRICTED_MESSAGE = "퇴사자 정보는 관리자만 조회할 수 있습니다."
 
 
 def build_unknown_org_answer(unknown_orgs: list[str]) -> str:
@@ -485,6 +487,32 @@ def limit_hits_by_employee_count(
             limited_hits.append(hit)
 
     return limited_hits
+
+
+def filter_retired_hits_by_permission(
+    hits: list[dict],
+    permission_level: int,
+) -> list[dict]:
+    if permission_level >= 3:
+        return hits
+
+    allowed_hits = []
+    retired_cache = {}
+
+    for hit in hits:
+        employee_id = hit.get("_source", {}).get("employee_id")
+
+        if not employee_id:
+            allowed_hits.append(hit)
+            continue
+
+        if employee_id not in retired_cache:
+            retired_cache[employee_id] = is_retired_employee(employee_id)
+
+        if not retired_cache[employee_id]:
+            allowed_hits.append(hit)
+
+    return allowed_hits
 
 
 def format_allowed_hits_answer(
@@ -1447,6 +1475,25 @@ def process_task(
     else:
         search_employee_id = extract_employee_id(original_question)
 
+    if (
+        search_employee_id
+        and search_employee_id != requester_employee_id
+        and permission_level < 3
+        and is_retired_employee(search_employee_id)
+    ):
+        return {
+            "answer": RETIRED_EMPLOYEE_RESTRICTED_MESSAGE,
+            "sources": [],
+            "permission": {
+                "allowed": False,
+                "permission_level": permission_level,
+                "required_level": 3,
+                "allowed_fields": [],
+                "denied_fields": answer_fields,
+                "is_self": is_self,
+            },
+        }
+
     search_filters = filters
     if search_employee_id and intent == "single_lookup":
         # 사번이 확정되면 이름/직함 같은 보조 필터는 빼고 사번 기준으로만 조회한다.
@@ -1563,6 +1610,10 @@ def process_task(
             position=task.get("position"),
             size=10000,
         )
+        search_hits = filter_retired_hits_by_permission(
+            hits=search_hits,
+            permission_level=permission_level,
+        )
 
         # 실제 사용자에게 보여줄 답변 문자열로 변환한다. 
         answer = format_allowed_hits_answer(
@@ -1613,6 +1664,10 @@ def process_task(
             answer_fields=answer_fields,
         )
         search_hits = sort_hits_by_task_sort(search_hits, sort)
+        search_hits = filter_retired_hits_by_permission(
+            hits=search_hits,
+            permission_level=permission_level,
+        )
 
         if not search_hits:
             answer = NO_SEARCH_RESULT_MESSAGE
@@ -1661,6 +1716,10 @@ def process_task(
         search_hits = filter_hits_with_answer_values(
             hits=search_hits,
             answer_fields=answer_fields,
+        )
+        search_hits = filter_retired_hits_by_permission(
+            hits=search_hits,
+            permission_level=permission_level,
         )
         search_hits = sort_hits_by_task_sort(search_hits, sort)
 

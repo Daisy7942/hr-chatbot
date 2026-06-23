@@ -660,6 +660,46 @@ def get_user_permission_level(employee_id: str) -> int | None:
     return max(department_level, job_grade_level)
 
 
+def is_retired_employee(employee_id: str) -> bool:
+    """
+    요청자 사번이 퇴사자이면 True를 반환한다.
+    퇴직일자 값이 비어 있거나 '미입력'이면 재직자로 본다.
+    """
+
+    if not employee_id:
+        return False
+
+    query = {
+        "query": {
+            "bool": {
+                "filter": [
+                    {"term": {"employee_id": employee_id.strip().upper()}}
+                ]
+            }
+        },
+        "size": 1,
+        "_source": ["embedding_text"],
+    }
+
+    response = client.search(
+        index=["hr_basic_3"],
+        body=query,
+    )
+
+    hits = response["hits"]["hits"]
+
+    if not hits:
+        return False
+
+    source = hits[0].get("_source", {})
+    retirement_date = extract_embedding_text_field(
+        embedding_text=source.get("embedding_text", ""),
+        field_name="퇴직일자",
+    )
+
+    return bool(retirement_date and retirement_date.strip() not in {"미입력", "NULL", "None", "none", "null", "-"})
+
+
 # =========================
 # 질문 기반 검색 인덱스 선택 함수
 # =========================
