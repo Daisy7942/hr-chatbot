@@ -47,12 +47,18 @@ function chatbot() {
 
     async retry(failedQuestion) {
       if (!failedQuestion) return;
+      // 재시도 전에 이 질문의 에러 버블을 먼저 제거한다
+      this.messages = this.messages.filter(
+        msg => !(msg.role === "error" && msg.question === failedQuestion)
+      );
       await this.callBackend(failedQuestion);
     },
 
     async callBackend(userQuestion) {
       this.loading = true;
       this.scrollToBottom();
+
+      const startTime = Date.now();
 
       try {
         const response = await fetch(API_BASE_URL + "/rag-chat", {
@@ -71,7 +77,8 @@ function chatbot() {
         }
 
         const data = await response.json();
-        this.messages.push({ role: "bot", text: data.answer, sources: data.sources || [] });
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        this.messages.push({ role: "bot", text: data.answer, sources: data.sources || [], elapsed });
 
         if (data.permission && data.permission.permission_level) {
           this.permissionLevel = data.permission.permission_level;

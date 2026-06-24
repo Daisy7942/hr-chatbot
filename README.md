@@ -55,39 +55,14 @@ cd Durian
 ---
 
 ## STEP 2 — OpenSearch 준비
-이 프로젝트는 OpenSearch를 검색 엔진으로 사용합니다. 
-OpenSearch 서버 자체는 자동 설치되지 않으므로 로컬에 직접 설치하고 실행해야 합니다.
+
+이 프로젝트는 OpenSearch를 검색 엔진으로 사용합니다.
+OpenSearch 서버 자체는 자동 설치되지 않으므로, **OpenSearch 설치 가이드에 따라 직접 설치하고 실행**해 주세요.
 단, 한글 형태소 분석기인 **nori 플러그인**은 파이프라인 실행 시 자동 설치됩니다.
 
-  권장 버전: OpenSearch 3.3.2
 
-  ### 1. OpenSearch 다운로드
-
-  OpenSearch 공식 다운로드 페이지에서 운영체제에 맞는 배포판을 다운로드합니다.
-   ```bash
-   https://opensearch.org/downloads.html
-   ``` 
-
-  압축을 해제한 뒤, 해당 경로를 .env의 OPENSEARCH_HOME에 설정합니다.
-   ```env
-   OPENSEARCH_HOME=C:\path\to\opensearch-3.3.2
-   ```
-
-  ### 2. OpenSearch 실행 (Window 기준)
-
-   ```bash
-    cd C:\path\to\opensearch-3.3.2
-    bin\opensearch.bat
-   ```
-
-  ### 3. 접속 확인
-
-   ```bash
-   curl.exe -k -u admin:비밀번호 https://localhost:9200
-   ```
-
-  정상 실행 중이면 OpenSearch 버전 정보가 출력됩니다.
-  ※ 최초 1회 파이프라인(STEP 7) 실행 시 nori 플러그인이 자동 설치되며, 설치가 완료되면 안내에 따라 OpenSearch 서버를 한 번 재시작해 주셔야 합니다.
+> 권장 버전: OpenSearch **3.3.2**
+> 한글 형태소 분석기인 **nori 플러그인**은 파이프라인 실행 시 자동 설치됩니다.
 
 ---
 
