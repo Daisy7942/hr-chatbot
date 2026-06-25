@@ -262,7 +262,7 @@ http://localhost:3000
 ## 디렉터리 구조
 
 ```
-Durian/
+hr-chatbot/
 ├── .env                    ← 환경 변수 (직접 생성, git 제외)
 ├── .env.example            ← 환경 변수 템플릿
 ├── pipeline.py             ← 전체 파이프라인 (1~3단계)
